@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make test-infra:*)",
+      "Bash(curl:*)",
+      "Bash(docker compose:*)"
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(test -f docker-compose.yml)",
+      "Bash(dir /s /b *.py)",
+      "Bash(findstr /i \"ingestion\")",
+      "Bash(test -f Dockerfile)",
+      "Bash(test -f requirements.txt)"
+    ]
+  }
+}

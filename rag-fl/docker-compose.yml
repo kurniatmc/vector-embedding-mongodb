@@ -1,0 +1,224 @@
+services:
+
+  # ── MongoDB 7 — single-node replica set rs0 ──────────────────────────────
+  mongo:
+    image: mongo:7.0
+    container_name: ragfl-mongo
+    command:
+      - mongod
+      - --replSet
+      - rs0
+      - --bind_ip_all
+      - --wiredTigerCacheSizeGB
+      - "1"          # hard cap inside container (2 GB container limit)
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - ragfl
+    # Healthy = this node is the PRIMARY (replica set fully ready)
+    healthcheck:
+      test: >
+        mongosh --quiet --eval
+        "try { quit(db.isMaster().ismaster ? 0 : 1) } catch(e) { quit(1) }"
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  # ── Replica-set + collection init (runs once, then exits) ─────────────────
+  mongo-init:
+    image: mongo:7.0
+    container_name: ragfl-mongo-init
+    depends_on:
+      mongo:
+        condition: service_started   # only needs mongod to be up, not primary yet
+    volumes:
+      - ./infra/mongo-init:/scripts:ro
+    networks:
+      - ragfl
+    restart: "no"
+    entrypoint: ["bash", "/scripts/init.sh"]
+
+  # ── Redis 7 — append-only persistence, 512 MB cap ────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ragfl-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ragfl
+    command:
+      - redis-server
+      - --appendonly yes
+      - --maxmemory 512mb
+      - --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  # ── fake-gcs-server — identical REST/JSON API to Google Cloud Storage ─────
+  fake-gcs:
+    image: fsouza/fake-gcs-server:latest
+    container_name: ragfl-fake-gcs
+    ports:
+      - "4443:4443"
+    volumes:
+      - gcs_data:/data
+    networks:
+      - ragfl
+    # HTTP scheme matches GCS_ENDPOINT=http://fake-gcs:4443 in .env
+    command:
+      - -scheme
+      - http
+      - -port
+      - "4443"
+      - -filesystem-root
+      - /data
+      - -public-host
+      - fake-gcs:4443
+
+  # ── Gotenberg — LibreOffice headless REST service (PPTX/DOCX → PDF) ───────
+  libreoffice:
+    image: gotenberg/gotenberg:8
+    container_name: ragfl-libreoffice
+    ports:
+      - "3000:3000"
+    networks:
+      - ragfl
+    environment:
+      - GOTENBERG_API_TIMEOUT=60s
+
+  # ── Ingestion Service — Phase 2 ──────────────────────────────────────────
+  ingestion:
+    build:
+      context: .                                  # project root (needs shared/ + services/)
+      dockerfile: services/ingestion/Dockerfile
+    container_name: ragfl-ingestion
+    ports:
+      - "${INGESTION_PORT:-8001}:8001"
+    volumes:
+      - "${INPUT_DIR}:/input"
+      - "${OUTPUT_DIR}:/output"
+    networks:
+      - ragfl
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      - MONGODB_URI=${MONGODB_URI}
+      - MONGODB_DB=${MONGODB_DB}
+      - GCS_ENDPOINT=${GCS_ENDPOINT}
+      - GCS_BUCKET=${GCS_BUCKET}
+      - REDIS_URL=${REDIS_URL}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - ENVIRONMENT=${ENVIRONMENT}
+      - DRY_RUN_THRESHOLD=${DRY_RUN_THRESHOLD}
+      - LIBREOFFICE_URL=${LIBREOFFICE_URL}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── rag-fl Pipeline Service — Phase 3 ────────────────────────────────────
+  rag-fl:
+    build:
+      context: .
+      dockerfile: services/rag-fl/Dockerfile
+    container_name: ragfl-pipeline
+    ports:
+      - "${RAG_FL_PORT:-8004}:8004"
+    volumes:
+      - "${OUTPUT_DIR}:/output"
+    networks:
+      - ragfl
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      fake-gcs:
+        condition: service_started
+    env_file: .env
+    environment:
+      - MONGODB_URI=${MONGODB_URI}
+      - MONGODB_DB=${MONGODB_DB}
+      - GCS_ENDPOINT=${GCS_ENDPOINT}
+      - GCS_BUCKET=${GCS_BUCKET}
+      - REDIS_URL=${REDIS_URL}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - ENVIRONMENT=${ENVIRONMENT}
+      - DRY_RUN_THRESHOLD=${DRY_RUN_THRESHOLD}
+      - FORCE_MIXED_MODE=${FORCE_MIXED_MODE}
+      - OUTPUT_DIR=/output
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Next.js Observability UI — Phase 4 ───────────────────────────────────
+  ui:
+    build:
+      context: ./services/ui
+    container_name: ragfl-ui
+    ports:
+      - "3001:3001"
+    networks:
+      - ragfl
+    depends_on:
+      - ingestion
+      - rag-fl
+    environment:
+      # Browser fetches these directly (localhost = host machine from browser)
+      - NEXT_PUBLIC_RAG_FL_API=http://localhost:8004
+      - NEXT_PUBLIC_INGESTION_API=http://localhost:8001
+      - NEXT_PUBLIC_FORCE_MIXED_MODE=${FORCE_MIXED_MODE:-false}
+    restart: unless-stopped
+
+  # ── Mongo Express — browser-based MongoDB admin UI ────────────────────────
+  mongo-express:
+    image: mongo-express:1.0.2
+    container_name: ragfl-mongo-express
+    ports:
+      - "8081:8081"
+    networks:
+      - ragfl
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      - ME_CONFIG_MONGODB_SERVER=mongo
+      - ME_CONFIG_MONGODB_PORT=27017
+      - ME_CONFIG_BASICAUTH=false
+    restart: unless-stopped
+
+networks:
+  ragfl:
+    driver: bridge
+
+volumes:
+  mongo_data:
+  redis_data:
+  gcs_data:
