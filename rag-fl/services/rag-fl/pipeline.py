@@ -55,11 +55,14 @@ from shared.utils.period_extractor import extract_report_period  # noqa: E402
 from classifier import classify_non_pdf, classify_pdf_pages  # noqa: E402
 from chunker import (  # noqa: E402
     chunk_excel_sheet,
+    chunk_specific_table,
     chunk_table_page,
     chunk_text_page,
+    chunk_whitespace_table,
     chunk_yaml_content,
     render_and_upload_image_file,
     render_and_upload_multimodal,
+    render_and_upload_visual_region,
 )
 from embedder import embed_texts  # noqa: E402
 from vision import describe_page_image, is_circuit_open  # noqa: E402
@@ -111,6 +114,51 @@ def _excel_sheets_to_markdown(file_bytes: bytes) -> list[dict]:
         })
     wb.close()
     return sheets
+
+
+# ── Caption detection helper ──────────────────────────────────────────────────
+
+def _find_caption_near_visual(
+    fitz_doc: fitz.Document,
+    page_number: int,
+    bbox: list,
+    exclude_bboxes: list | None = None,
+) -> str:
+    """
+    Scan text blocks within 25pt above or below a visual bbox for caption-like text.
+    A caption is: <300 chars, horizontally overlapping with the visual, and located
+    directly above or below it (gap ≤ 25pt). Blocks inside other table/visual bboxes
+    (passed as exclude_bboxes) are ignored to avoid false captures.
+
+    Returns the caption string (stripped) or "" if none found.
+    """
+    fitz_page = fitz_doc[page_number - 1]
+    raw_blocks = fitz_page.get_text("blocks")
+    vx0, vy0, vx1, vy1 = bbox
+    ex_fitz = [fitz.Rect(r) for r in (exclude_bboxes or [])]
+    captions: list[str] = []
+
+    for block in raw_blocks:
+        if block[6] != 0:
+            continue
+        bx0, by0, bx1, by1 = block[:4]
+        block_text = block[4].strip()
+        if not block_text or len(block_text) > 300:
+            continue
+        # Must have horizontal overlap with visual
+        if min(bx1, vx1) - max(bx0, vx0) < 10:
+            continue
+        gap_above = vy0 - by1   # positive → block is above visual
+        gap_below = by0 - vy1   # positive → block is below visual
+        if not (0 <= gap_above <= 25 or 0 <= gap_below <= 25):
+            continue
+        # Skip if inside another excluded bbox (table or another visual)
+        cx, cy = (bx0 + bx1) / 2, (by0 + by1) / 2
+        if any(er.contains(fitz.Point(cx, cy)) for er in ex_fitz):
+            continue
+        captions.append(block_text)
+
+    return " ".join(captions)
 
 
 # ── Core pipeline function ────────────────────────────────────────────────────
@@ -177,9 +225,16 @@ def run_pipeline(
                 "pages": len(classifications), "classifications": classifications}
 
     # ── Pre-flight: count Gemini calls ───────────────────────────────────────
-    gemini_pages = [c for c in classifications
-                    if c.page_type in ("multimodal", "mixed") and c.page_type != "skip"]
-    gemini_call_estimate = len(gemini_pages)
+    # Count visual elements (element-based) or fall back to page count (legacy)
+    gemini_call_estimate = 0
+    for c in classifications:
+        if c.page_type == "skip":
+            continue
+        struct_elements = [e for e in c.detected_elements if isinstance(e, dict)]
+        if struct_elements:
+            gemini_call_estimate += sum(1 for e in struct_elements if e.get("type") == "visual")
+        elif c.page_type in ("multimodal", "mixed"):
+            gemini_call_estimate += 1
 
     if gemini_call_estimate > DRY_RUN_THRESHOLD and not auto_confirm:
         print(f"\n⚠️  Estimated {gemini_call_estimate} Gemini Vision calls "
@@ -212,50 +267,122 @@ def run_pipeline(
                 if cls.page_type == "skip":
                     logger.info(f"Page {pnum}: skip — no embedding created")
 
-                elif cls.page_type == "text":
-                    page_chunks = chunk_text_page(fitz_doc, pnum, doc_id, original_format)
+                else:
+                    struct_elements = [
+                        e for e in cls.detected_elements
+                        if isinstance(e, dict) and e.get("type") not in (None, "none")
+                    ]
 
-                elif cls.page_type == "table":
-                    page_chunks = chunk_table_page(plumber_doc.pages, pnum, doc_id, original_format)
+                    if struct_elements:
+                        # ── Element-based dispatch ────────────────────────────
+                        chunk_idx = 0
+                        visual_idx = 0
 
-                elif cls.page_type == "multimodal":
-                    chunk, png_bytes = render_and_upload_multimodal(
-                        fitz_doc, pnum, doc_id, original_format, chunk_index=0
-                    )
-                    if chunk:
-                        desc = describe_page_image(png_bytes)
-                        if desc:
-                            chunk.chunk_text = desc
-                            gemini_calls_made += 1
-                        else:
-                            chunk.chunk_text = f"[Page {pnum}: image description unavailable]"
-                            if is_circuit_open():
-                                needs_vision_retry.append(chunk.chunk_id)
-                        page_chunks = [chunk]
-                    del png_bytes
+                        # Collect table+visual bboxes to exclude from text extraction.
+                        # This prevents table cell text and visual labels from leaking
+                        # into text chunks (root fix for Issue 1).
+                        exclude_bboxes = [
+                            e["bbox"] for e in struct_elements
+                            if e.get("bbox") and e["type"] in ("table", "visual")
+                        ]
 
-                elif cls.page_type == "mixed":
-                    # chunk_index=0: text
-                    text_parts = chunk_text_page(
-                        fitz_doc, pnum, doc_id, original_format, chunk_index_start=0
-                    )
-                    # chunk_index=1: full-page image
-                    vis_chunk, png_bytes = render_and_upload_multimodal(
-                        fitz_doc, pnum, doc_id, original_format, chunk_index=1
-                    )
-                    if vis_chunk:
-                        desc = describe_page_image(png_bytes)
-                        if desc:
-                            vis_chunk.chunk_text = desc
-                            gemini_calls_made += 1
-                        else:
-                            vis_chunk.chunk_text = f"[Page {pnum}: image description unavailable]"
-                            if is_circuit_open():
-                                needs_vision_retry.append(vis_chunk.chunk_id)
-                        page_chunks = text_parts + [vis_chunk]
+                        # Text: one call covers all text blocks on the page
+                        if any(e["type"] == "text" for e in struct_elements):
+                            text_chunks = chunk_text_page(
+                                fitz_doc, pnum, doc_id, original_format,
+                                chunk_index_start=chunk_idx,
+                                exclude_rects=exclude_bboxes or None,
+                            )
+                            page_chunks.extend(text_chunks)
+                            chunk_idx += len(text_chunks)
+
+                        # Tables: one chunk per detected table element
+                        for elem in struct_elements:
+                            if elem["type"] != "table":
+                                continue
+                            if elem.get("rows"):
+                                # Pre-extracted rows (whitespace or text+lines strategy)
+                                tbl_chunks = chunk_whitespace_table(
+                                    elem["rows"], pnum, doc_id, original_format,
+                                    table_index=elem["table_index"],
+                                    chunk_index_start=chunk_idx,
+                                )
+                            else:
+                                tbl_chunks = chunk_specific_table(
+                                    plumber_doc.pages, pnum, doc_id, original_format,
+                                    table_index=elem["table_index"],
+                                    chunk_index_start=chunk_idx,
+                                )
+                            page_chunks.extend(tbl_chunks)
+                            chunk_idx += len(tbl_chunks)
+
+                        # Visuals: one Gemini call per detected visual region
+                        for elem in struct_elements:
+                            if elem["type"] != "visual":
+                                continue
+                            vis_chunk, png_bytes = render_and_upload_visual_region(
+                                fitz_doc, pnum, elem["bbox"], doc_id, original_format,
+                                chunk_index=chunk_idx, visual_index=visual_idx,
+                            )
+                            if vis_chunk:
+                                desc = describe_page_image(png_bytes)
+                                if desc:
+                                    # Prepend figure/chart caption if found near the bbox
+                                    caption = _find_caption_near_visual(
+                                        fitz_doc, pnum, elem["bbox"], exclude_bboxes
+                                    )
+                                    vis_chunk.chunk_text = (
+                                        f"{caption}\n\n{desc}" if caption else desc
+                                    )
+                                    gemini_calls_made += 1
+                                else:
+                                    vis_chunk.chunk_text = (
+                                        f"[Page {pnum}: image description unavailable]"
+                                    )
+                                    if is_circuit_open():
+                                        needs_vision_retry.append(vis_chunk.chunk_id)
+                                page_chunks.append(vis_chunk)
+                                chunk_idx += 1
+                                visual_idx += 1
+                            if png_bytes:
+                                del png_bytes
+
                     else:
-                        page_chunks = text_parts
-                    del png_bytes
+                        # ── Legacy fallback (FORCE_MIXED_MODE / non-struct elements) ──
+                        if cls.page_type == "text":
+                            page_chunks = chunk_text_page(fitz_doc, pnum, doc_id, original_format)
+
+                        elif cls.page_type == "table":
+                            page_chunks = chunk_table_page(
+                                plumber_doc.pages, pnum, doc_id, original_format
+                            )
+
+                        elif cls.page_type in ("multimodal", "mixed"):
+                            text_parts = []
+                            if cls.page_type == "mixed":
+                                text_parts = chunk_text_page(
+                                    fitz_doc, pnum, doc_id, original_format,
+                                    chunk_index_start=0,
+                                )
+                            vis_chunk, png_bytes = render_and_upload_multimodal(
+                                fitz_doc, pnum, doc_id, original_format,
+                                chunk_index=len(text_parts),
+                            )
+                            if vis_chunk:
+                                desc = describe_page_image(png_bytes)
+                                if desc:
+                                    vis_chunk.chunk_text = desc
+                                    gemini_calls_made += 1
+                                else:
+                                    vis_chunk.chunk_text = (
+                                        f"[Page {pnum}: image description unavailable]"
+                                    )
+                                    if is_circuit_open():
+                                        needs_vision_retry.append(vis_chunk.chunk_id)
+                                page_chunks = text_parts + [vis_chunk]
+                            else:
+                                page_chunks = text_parts
+                            del png_bytes
 
                 all_chunks.extend(page_chunks)
                 page_chunk_summary.append({
@@ -325,11 +452,12 @@ def run_pipeline(
     # ── Batch embedding ───────────────────────────────────────────────────────
     if all_chunks:
         texts = [c.chunk_text for c in all_chunks]
-        logger.info(f"Embedding {len(texts)} chunks via text-embedding-004 ...")
+        _embedding_model = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
+        logger.info(f"Embedding {len(texts)} chunks via {_embedding_model} ...")
         embeddings = embed_texts(texts)
         for chunk, emb in zip(all_chunks, embeddings):
             chunk.embedding = emb
-            chunk.embedding_model = "models/gemini-embedding-001"
+            chunk.embedding_model = _embedding_model
             chunk.embedding_task_type = "RETRIEVAL_DOCUMENT"
 
     # ── Store to MongoDB doc_embeddings ───────────────────────────────────────

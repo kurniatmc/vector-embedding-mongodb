@@ -105,7 +105,8 @@ Not applicable — Phase 2 is ingestion only. No Gemini Vision or embedding call
 - [ ] OneDrive webhook is a stub — only logs and returns 200. Real download from Graph API deferred to Phase 3+.
 - [ ] Folder watcher ingest URL is hardcoded to `http://localhost:8001/ingest` — works when watcher runs inside the container (same process). Uses httpx for internal call.
 - [ ] Dry run `estimated_multimodal_pages` and `estimated_text_chunks` are rough heuristics (1/4 of pages = multimodal, 3 chunks/page). Phase 4 page_profiles will give exact values.
-- [ ] Duplicate file uploads are allowed — same filename can be ingested multiple times, each gets a new `doc_id`. Phase 3 file ledger will add deduplication.
+- [x] ~~Duplicate file uploads are allowed~~ → **UPDATED Phase 3:** Content-hash deduplication implemented via SHA-256. Duplicate files return `is_duplicate: true`.
+- [x] **UPDATED Phase 4.1:** Auto-process after upload implemented. Background task triggers pipeline processing automatically; rollback on failure. See `phase_4.1_workflow_improvements.md`.
 - [ ] `text/plain` → YAML fallback could misroute actual text files if extension is not present.
 
 ---

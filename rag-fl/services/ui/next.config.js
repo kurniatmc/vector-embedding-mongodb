@@ -11,6 +11,8 @@ const nextConfig = {
     NEXT_PUBLIC_FORCE_MIXED_MODE:
       process.env.NEXT_PUBLIC_FORCE_MIXED_MODE || "",
   },
+  // Transpile ESM-only packages so Next.js (CommonJS bundler) can consume them.
+  transpilePackages: ["react-markdown", "remark-gfm"],
 };
 
 module.exports = nextConfig;

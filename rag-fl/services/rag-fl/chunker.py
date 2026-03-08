@@ -14,6 +14,7 @@ from typing import Optional
 
 import fitz  # PyMuPDF
 import pdfplumber
+from PIL import Image
 
 from shared.schemas.chunk import ChunkRecord
 from shared.utils.gcs_client import upload_bytes
@@ -26,6 +27,17 @@ _HEADING_RE = re.compile(
     r"^(\d+\.\d+(\.\d+)?|[A-Z][A-Z\s]{4,}[A-Z])\s",
 )
 
+# Matches classifier.py — loose settings to catch small tables
+_TABLE_SETTINGS = {
+    "vertical_strategy":   "lines",
+    "horizontal_strategy": "lines",
+    "min_words_vertical":  1,
+    "min_words_horizontal": 1,
+    "snap_tolerance":      3,
+    "join_tolerance":      3,
+    "edge_min_length":     3,
+}
+
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -35,10 +47,43 @@ def chunk_text_page(
     doc_id: str,
     original_format: str,
     chunk_index_start: int = 0,
+    exclude_rects: list | None = None,
 ) -> list[ChunkRecord]:
-    """Extract text from page and split into heading-bounded 500-800 token chunks."""
+    """
+    Extract text from page and split into heading-bounded 500-800 token chunks.
+
+    exclude_rects: optional list of [x0, y0, x1, y1] bboxes whose content should
+    be excluded (table regions, visual regions). Blocks whose center falls inside
+    any excluded rect, or that overlap > 40%, are skipped.
+    This prevents table cell text from leaking into text chunks.
+    """
     fitz_page = fitz_doc[page_number - 1]
-    full_text = fitz_page.get_text()
+
+    if exclude_rects:
+        ex_fitz = [fitz.Rect(r) for r in exclude_rects]
+        raw_blocks = fitz_page.get_text("blocks")
+        kept: list[str] = []
+        for block in raw_blocks:
+            if block[6] != 0:   # only text blocks
+                continue
+            cx = (block[0] + block[2]) / 2
+            cy = (block[1] + block[3]) / 2
+            center_pt = fitz.Point(cx, cy)
+            # Exclude if center is inside any excluded rect
+            if any(er.contains(center_pt) for er in ex_fitz):
+                continue
+            # Also exclude by overlap ratio
+            br = fitz.Rect(block[:4])
+            br_area = br.get_area()
+            if br_area > 0 and any(
+                (br & er).get_area() / br_area > 0.4 for er in ex_fitz
+            ):
+                continue
+            kept.append(block[4])
+        full_text = "\n".join(kept)
+    else:
+        full_text = fitz_page.get_text()
+
     if not full_text.strip():
         return []
 
@@ -97,12 +142,95 @@ def chunk_table_page(
                 chunk_text=md,
                 gcs_image_path=None,
                 embedding=None,
-                embedding_model="models/gemini-embedding-001",
+                embedding_model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
                 embedding_task_type="RETRIEVAL_DOCUMENT",
             ))
     except Exception as e:
         logger.warning(f"Table extraction failed page {page_number}: {e}")
     return chunks
+
+
+def chunk_specific_table(
+    plumber_pages,
+    page_number: int,
+    doc_id: str,
+    original_format: str,
+    table_index: int,
+    chunk_index_start: int = 0,
+) -> list[ChunkRecord]:
+    """Extract the Nth detected table (by classifier table_index) and return as Markdown chunk."""
+    try:
+        pl_page = plumber_pages[page_number - 1]
+        tables = pl_page.find_tables(table_settings=_TABLE_SETTINGS)
+        if table_index >= len(tables):
+            logger.warning(
+                f"Page {page_number}: table_index {table_index} out of range "
+                f"({len(tables)} tables found)"
+            )
+            return []
+        data = tables[table_index].extract()
+        if not data:
+            return []
+        md = _table_to_markdown(data)
+        if not md.strip():
+            return []
+        return [ChunkRecord(
+            chunk_id=str(uuid.uuid4()),
+            doc_id=doc_id,
+            page_number=page_number,
+            section_title="",
+            chunk_index=chunk_index_start,
+            format_provenance={"original_format": original_format, "table_index": table_index},
+            chunk_type="table",
+            chunk_text=md,
+            gcs_image_path=None,
+            embedding=None,
+            embedding_model="models/gemini-embedding-001",
+            embedding_task_type="RETRIEVAL_DOCUMENT",
+        )]
+    except Exception as e:
+        logger.warning(f"chunk_specific_table failed page {page_number} table {table_index}: {e}")
+        return []
+
+
+def chunk_whitespace_table(
+    rows: list,
+    page_number: int,
+    doc_id: str,
+    original_format: str,
+    table_index: int,
+    chunk_index_start: int = 0,
+) -> list[ChunkRecord]:
+    """
+    Create a table chunk from pre-detected whitespace-aligned rows.
+    rows: list of lists of cell strings, already extracted by classifier.py.
+    """
+    md = _table_to_markdown(rows)
+    if not md.strip():
+        return []
+    # Reject tables containing CID encoding artifacts (undecodable glyphs from
+    # CID-mapped fonts). These indicate the text could not be reliably extracted.
+    if "(cid:" in md:
+        logger.debug(f"Page {page_number}: whitespace table rejected — CID artifacts in content")
+        return []
+    return [ChunkRecord(
+        chunk_id=str(uuid.uuid4()),
+        doc_id=doc_id,
+        page_number=page_number,
+        section_title="",
+        chunk_index=chunk_index_start,
+        format_provenance={
+            "original_format": original_format,
+            "table_index": table_index,
+            "whitespace_table": True,
+        },
+        chunk_type="table",
+        chunk_text=md,
+        gcs_image_path=None,
+        embedding=None,
+        embedding_model="models/gemini-embedding-001",
+        embedding_task_type="RETRIEVAL_DOCUMENT",
+    )]
 
 
 def chunk_excel_sheet(
@@ -193,6 +321,90 @@ def render_and_upload_multimodal(
         format_provenance={"original_format": original_format},
         chunk_type="multimodal",
         chunk_text="",          # filled by vision.py
+        gcs_image_path=gcs_image_path,
+        embedding=None,
+        embedding_model="models/gemini-embedding-001",
+        embedding_task_type="RETRIEVAL_DOCUMENT",
+    )
+    return chunk, png_bytes
+
+
+def render_and_upload_visual_region(
+    fitz_doc: fitz.Document,
+    page_number: int,
+    bbox: list,
+    doc_id: str,
+    original_format: str,
+    chunk_index: int = 0,
+    visual_index: int = 0,
+) -> tuple[Optional[ChunkRecord], Optional[bytes]]:
+    """
+    Render a clipped bounding-box region of a PDF page to PNG and upload to GCS.
+    visual_index=0 → gcs_key = {doc_id}.{page_number}  (backward compat with /image endpoint)
+    visual_index>0 → gcs_key = {doc_id}.{page_number}.v{visual_index}
+    Returns (ChunkRecord with empty chunk_text, png_bytes). chunk_text filled by vision.py.
+    """
+    output_dir = os.getenv("OUTPUT_DIR", "/output")
+    gcs_bucket = os.getenv("GCS_BUCKET", "rag-fl-documents")
+
+    try:
+        fitz_page = fitz_doc[page_number - 1]
+        clip = fitz.Rect(bbox)
+        mat = fitz.Matrix(2, 2)
+        pix = fitz_page.get_pixmap(matrix=mat, clip=clip)
+
+        flat_dir = Path(output_dir) / "flat-images"
+        flat_dir.mkdir(parents=True, exist_ok=True)
+        suffix = "" if visual_index == 0 else f".v{visual_index}"
+        out_path = flat_dir / f"{doc_id}_page_{page_number}{suffix}.png"
+        pix.save(str(out_path))
+
+        png_bytes = pix.tobytes("png")
+        del pix
+
+        # Smart whitespace crop: trim to non-white content + 10px padding
+        try:
+            pil = Image.open(io.BytesIO(png_bytes))
+            gray = pil.convert("L").point(lambda x: 0 if x > 240 else 255)
+            content_bb = gray.getbbox()
+            if content_bb:
+                W, H = pil.size
+                x0c = max(0, content_bb[0] - 10)
+                y0c = max(0, content_bb[1] - 10)
+                x1c = min(W, content_bb[2] + 10)
+                y1c = min(H, content_bb[3] + 10)
+                cropped = pil.crop((x0c, y0c, x1c, y1c))
+                buf = io.BytesIO()
+                cropped.save(buf, format="PNG")
+                png_bytes = buf.getvalue()
+        except Exception:
+            pass  # use original render if trim fails
+
+    except Exception as e:
+        logger.error(f"Visual region render failed page {page_number} visual {visual_index}: {e}")
+        return None, None
+
+    gcs_key = (
+        f"{doc_id}.{page_number}"
+        if visual_index == 0
+        else f"{doc_id}.{page_number}.v{visual_index}"
+    )
+    gcs_image_path = None
+    try:
+        upload_bytes(png_bytes, gcs_key, content_type="image/png")
+        gcs_image_path = f"gs://{gcs_bucket}/{gcs_key}"
+    except Exception as e:
+        logger.error(f"GCS upload failed page {page_number} visual {visual_index}: {e}")
+
+    chunk = ChunkRecord(
+        chunk_id=str(uuid.uuid4()),
+        doc_id=doc_id,
+        page_number=page_number,
+        section_title="",
+        chunk_index=chunk_index,
+        format_provenance={"original_format": original_format, "visual_index": visual_index},
+        chunk_type="multimodal",
+        chunk_text="",
         gcs_image_path=gcs_image_path,
         embedding=None,
         embedding_model="models/gemini-embedding-001",

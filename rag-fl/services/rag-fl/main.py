@@ -62,9 +62,11 @@ app.include_router(citation_router)
 app.include_router(search_router)
 
 # Allow Next.js UI (localhost:3001) to call this API from the browser
+# CORS_ORIGINS can be comma-separated list for production (e.g., "https://app.domain.com,https://admin.domain.com")
+_cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3001,http://127.0.0.1:3001").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3001", "http://127.0.0.1:3001"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -220,11 +222,14 @@ async def document_page_chunks(doc_id: str, page_number: int):
 # ── GCS image proxy (Phase 4 — avoids CORS from browser to fake-gcs) ─────────
 
 @app.get("/image/{doc_id}/{page_number}")
-async def get_page_image(doc_id: str, page_number: int):
-    """Proxy a page PNG from fake-gcs to the browser. Avoids CORS issues."""
+async def get_page_image(doc_id: str, page_number: int, v: int = Query(0)):
+    """Proxy a page PNG from fake-gcs to the browser. Avoids CORS issues.
+    v=0 (default) → first visual: {doc_id}.{page_number}
+    v>0            → additional visual crops: {doc_id}.{page_number}.v{v}
+    """
     from shared.utils.gcs_client import download_bytes, blob_exists
 
-    gcs_path = f"{doc_id}.{page_number}"
+    gcs_path = f"{doc_id}.{page_number}" if v == 0 else f"{doc_id}.{page_number}.v{v}"
     if not blob_exists(gcs_path):
         raise HTTPException(status_code=404, detail=f"Image not found: {gcs_path}")
     try:

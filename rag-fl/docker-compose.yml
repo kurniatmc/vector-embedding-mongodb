@@ -192,8 +192,8 @@ services:
       - rag-fl
     environment:
       # Browser fetches these directly (localhost = host machine from browser)
-      - NEXT_PUBLIC_RAG_FL_API=http://localhost:8004
-      - NEXT_PUBLIC_INGESTION_API=http://localhost:8001
+      - NEXT_PUBLIC_RAG_FL_API=${NEXT_PUBLIC_RAG_FL_API}
+      - NEXT_PUBLIC_INGESTION_API=${NEXT_PUBLIC_INGESTION_API}
       - NEXT_PUBLIC_FORCE_MIXED_MODE=${FORCE_MIXED_MODE:-false}
     restart: unless-stopped
 

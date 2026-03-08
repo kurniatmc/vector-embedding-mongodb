@@ -55,22 +55,24 @@
 │  LEFT (288px)     │  CENTER (flex-1)              │  RIGHT (320px)    │
 │                   │                               │                   │
 │  [+ Upload File]  │  Page Explorer — N pages      │  Search           │
-│  [Process →]      │                               │  [textarea]       │
-│                   │  pg 1  [table]   2 chunks ▼   │  [Search button]  │
-│  filename.pdf     │    ▼ expanded:                │                   │
-│  EMBEDDED         │    [table] 768-dim ✓          │  84%  pg 7        │
-│  PDF  15pg  21ch  │    | Col | Col | Col |        │  [table]          │
-│                   │    |-----|-----|-----|        │  "| Churn | Int…" │
-│  Churn_EDA.pdf    │    | val | val | val |        │                   │
-│  EMBEDDED         │                               │  Citation label   │
-│  PDF  9pg  12ch   │  pg 2  [table]   2 chunks ▼   │                   │
-│  ...              │  pg 3  [skip]    0 chunks ▼   │                   │
-│                   │  pg 8  [multimodal] 1 chunk ▼ │                   │
-│  11 documents     │    ▼ expanded:                │                   │
+│                   │                               │  [textarea]       │
+│  filename.pdf     │  pg 1  [table]   2 chunks ▼   │  [Search button]  │
+│  EMBEDDED         │    ▼ expanded:                │                   │
+│  PDF  15pg  21ch  │    [table] 768-dim ✓          │  84%  pg 7        │
+│                   │    | Col | Col | Col |        │  [table]          │
+│  Churn_EDA.pdf    │    |-----|-----|-----|        │  "| Churn | Int…" │
+│  EMBEDDED         │    | val | val | val |        │                   │
+│  PDF  9pg  12ch   │                               │  Citation label   │
+│  ...              │  pg 2  [table]   2 chunks ▼   │                   │
+│                   │  pg 3  [skip]    0 chunks ▼   │                   │
+│  11 documents     │  pg 8  [multimodal] 1 chunk ▼ │                   │
+│                   │    ▼ expanded:                │                   │
 │                   │    [img] 768-dim ✓            │                   │
 │                   │    Gemini: "Pearson heatmap…" │                   │
 └───────────────────┴──────────────────────────────┴───────────────────┘
 ```
+
+**Note:** Phase 4.1 removed the "[Process →]" button — auto-process now triggered by background task after upload. See `phase_4.1_workflow_improvements.md`.
 
 **Badge colour scheme (as specified):**
 
@@ -127,7 +129,7 @@ curl -X POST http://localhost:8004/search/within/fb2c1e3e-a364-4470-9a5f-ea8f01a
 | Click page 1 (table) | Markdown table renders as HTML `<table>` with green header row. `768-dim ✓` in green. |
 | Click page 1 (text) | Raw chunk text in monospace pre block. |
 | Search: "churn rate fiber optic" | Right panel returns results with score bar (%), page badge, chunk type badge, 200-char snippet, citation label. Click a result → center panel scrolls to and expands that page. |
-| Upload button | File picker opens. After upload: "Process →" button appears. |
+| Upload button | File picker opens. **Phase 4.1:** Auto-process in background, UI shows "Processing in background…" → "✅ filename embedded! N chunks" when complete. |
 
 ### Next.js startup log
 
@@ -207,11 +209,76 @@ ui:
 
 ## 9. Known Limitations / TODOs
 
-- [ ] **Upload processing status poll:** After clicking "Process →", the UI shows the message returned by `/process` but does not poll `GET /document/{doc_id}/status` every 3s with a progress bar. The `/process` call blocks synchronously (acceptable for POC). Add async polling in Phase 5 if needed.
+- [x] ~~**Upload processing status poll**~~ → **RESOLVED Phase 4.1:** Auto-process via background task implemented. UI polls every 3s and shows "✅ filename embedded! N chunks" when complete. See `phase_4.1_workflow_improvements.md`.
 - [ ] **No healthcheck on ui container:** `docker compose ps` shows "running" but not "healthy". Add `healthcheck: test: ["CMD", "wget", "-qO-", "http://localhost:3001"]` if needed.
 - [ ] **next dev security advisory:** Next.js 14.2.30 used but `next dev` is not recommended for production. Phase 7 (Cloud Run) should switch to `next build` + `next start` with build args for NEXT_PUBLIC_ vars.
 - [ ] **Search requires EMBEDDED document:** Searching against a doc with no chunks returns 0 results silently. Should show "No embeddings yet — run Process first."
-- [ ] **Duplicate docs in left panel:** Some documents appear twice (same filename uploaded via different paths). Left panel shows all 11 DB records including duplicates from test runs. Phase 5 can add dedup filtering on the `/documents` endpoint.
+- [x] ~~**Duplicate docs in left panel**~~ → **RESOLVED Phase 4.1:** UI now filters `status === "EMBEDDED"` only. Files stuck at UPLOADED status are hidden. Content-hash deduplication from Phase 3 prevents duplicate uploads.
+- [x] ~~**Multi-visual pages show same image**~~ → **RESOLVED Phase 3B (2026-03-08):** See §Phase 3B UI Fixes below.
+
+---
+
+---
+
+# Phase 3B — UI Image Display Fix (applied 2026-03-08)
+**Status:** ✅ Complete
+**Scope:** Multi-visual page display — each multimodal chunk now shows its own distinct image crop.
+
+---
+
+## Problem
+
+Pages with multiple visual elements (e.g. Titanic page 11 with 3 charts) stored separate
+crops in GCS as `{doc_id}.{page}`, `{doc_id}.{page}.v1`, `{doc_id}.{page}.v2` — but the
+UI always fetched `GET /image/{doc_id}/{page_number}` regardless of which chunk was
+being displayed. Every chunk on a multi-visual page showed the same first crop.
+
+## Changes
+
+### `services/rag-fl/main.py`
+
+Added `v: int = Query(0)` parameter to `GET /image/{doc_id}/{page_number}`:
+```python
+@app.get("/image/{doc_id}/{page_number}")
+async def get_page_image(doc_id: str, page_number: int, v: int = Query(0)):
+    gcs_path = f"{doc_id}.{page_number}" if v == 0 else f"{doc_id}.{page_number}.v{v}"
+```
+- `v=0` (default) → `{doc_id}.{page_number}` — backward compatible
+- `v=1` → `{doc_id}.{page_number}.v1`
+- `v=N` → `{doc_id}.{page_number}.vN`
+
+### `services/ui/app/page.tsx`
+
+Added `gcsImageUrl()` helper:
+```typescript
+function gcsImageUrl(gcsPath: string | undefined, docId: string, pageNum: number): string {
+  const base = `${RAG_FL}/image/${docId}/${pageNum}`;
+  if (!gcsPath) return base;
+  const key = gcsPath.split("/").pop() ?? "";
+  const vMatch = key.match(/\.v(\d+)$/);
+  if (!vMatch) return base;
+  return `${base}?v=${vMatch[1]}`;
+}
+```
+Replaced hardcoded `src={RAG_FL/image/${doc_id}/${page_number}}` with
+`src={gcsImageUrl(chunk.gcs_image_path, selectedDoc.doc_id, pg.page_number)}`.
+
+The helper parses the `.v{n}` suffix directly from `chunk.gcs_image_path` stored in
+`doc_embeddings`, so the correct crop is always served regardless of how many visuals
+are on the page.
+
+## Verification
+
+```bash
+# v=0 first visual (200)
+curl -o /dev/null -w "%{http_code}" http://localhost:8004/image/{doc_id}/11
+# v=1 second visual (200)
+curl -o /dev/null -w "%{http_code}" http://localhost:8004/image/{doc_id}/11?v=1
+# v=2 third visual (200)
+curl -o /dev/null -w "%{http_code}" http://localhost:8004/image/{doc_id}/11?v=2
+# v=99 nonexistent (404)
+curl -o /dev/null -w "%{http_code}" http://localhost:8004/image/{doc_id}/11?v=99
+```
 
 ---
 

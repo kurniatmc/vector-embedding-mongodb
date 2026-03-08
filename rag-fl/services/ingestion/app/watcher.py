@@ -20,7 +20,7 @@ _in_flight: set[str] = set()
 _lock = threading.Lock()
 
 WATCH_DIR = "/input"
-INGEST_URL = "http://localhost:8001/ingest"
+INGEST_URL = os.getenv("INGEST_URL", "http://localhost:8001/ingest")
 SETTLE_SECONDS = 2  # wait after creation before reading (file might still be copying)
 SUPPORTED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".pptx", ".docx", ".yaml", ".yml", ".jpg", ".jpeg", ".png"}
 

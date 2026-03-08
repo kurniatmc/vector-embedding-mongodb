@@ -12,7 +12,7 @@ class PageProfile(BaseModel):
     doc_id: str
     page_number: int              # 1-indexed
     page_type: str                # "text" | "multimodal" | "table" | "mixed" | "skip" | "structured_text"
-    detected_elements: list[str] = Field(default_factory=list)  # e.g. ["text_blocks", "charts", "tables"]
+    detected_elements: list = Field(default_factory=list)  # list of {type, bbox, ...} dicts or legacy strings
     processing_recommendation: str = ""  # e.g. "embed_text_only" | "gemini_vision" | "skip"
     estimated_text_tokens: int = 0
     has_tables: bool = False

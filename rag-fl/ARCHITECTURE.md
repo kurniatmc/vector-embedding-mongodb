@@ -1,6 +1,6 @@
 # RAG-FL System Architecture
 > **Claude Code Context File** — Read this file COMPLETELY at the start of every session before writing any code.
-> Last updated: March 2026 — Post Harsh Meeting (Sync on Embedding)
+> Last updated: 2026-03-08 — Phases 3B, 3C, and UI (Phase 4 enhancements) complete
 
 ---
 
@@ -33,41 +33,320 @@ File Ledger / Batch Orchestration is DEFERRED — already exists in Harsh's prod
 
 ---
 
-## BMP Architecture Alignment
+## System Architecture — Complete Flow (Phases 1-6)
 
 ```
-                    INPUT SOURCES
-     manual upload | folder watcher | OneDrive webhook
-                           │
-                           ▼
-              ┌─────────────────────────┐
-              │   Format Registry       │  Phase 2 ✅
-              │   7 processors          │
-              │   MIME → Processor      │
-              └────────────┬────────────┘
-                           │  GCS: physical file
-                           │  MongoDB documents{}: metadata
-                           ▼
-              ┌─────────────────────────┐
-              │   rag-fl pipeline       │  Phase 3
-              │   Per-page classify     │
-              │   Chunk + Embed         │
-              │   Store vectors         │
-              └────────────┬────────────┘
-                           │
-              ┌────────────┴────────────┐
-              ▼                         ▼
-     MongoDB (vectors)            GCS Storage
-     doc_embeddings               {doc_id}.{page_number}
-     page_profiles                (flat images PNG)
-     documents
-                           │
-                           ▼
-              ┌─────────────────────────┐
-              │   Next.js UI            │  Phase 4
-              │   Observability         │
-              │   Pick file → explore   │
-              └─────────────────────────┘
+╔══════════════════════════════════════════════════════════════════════════╗
+║  INPUT SOURCES                                                           ║
+║  Browser upload (UI :3001)  │  CLI: pipeline.py --file <path>           ║
+╚════════════════════════════╤═════════════════════════════════════════════╝
+                             │
+                             ▼
+         ┌───────────────────────────────────────┐
+         │         Ingestion Service             │  :8001  Phase 2 ✅
+         │                                       │
+         │  Format Registry (MIME → Processor)   │
+         │    PDFProcessor  / ExcelProcessor      │
+         │    YAMLProcessor / ImageProcessor      │
+         │    PPTXProcessor / DOCXProcessor       │
+         │                                       │
+         │  • sha256 content_hash deduplication  │
+         │  • report_period extraction           │
+         │    (filename → PDF metadata → text)   │
+         │  • status = UPLOADED → MongoDB        │
+         │  • background task → POST /process    │  ← Phase 4.1 ✅
+         └──────────────────┬────────────────────┘
+                            │  documents{} status=UPLOADED
+                            │  httpx background → POST :8004/process
+                            ▼
+         ┌───────────────────────────────────────────────────────────────┐
+         │                   rag-fl Pipeline                             │
+         │                                      :8004  Phase 3 ✅        │
+         │  ┌─── STEP 1 — 4-LAYER TABLE DETECTION ───────────────────┐  │
+         │  │                                                         │  │
+         │  │  Strategy 1 — pdfplumber LINES             Phase 3A ✅  │  │
+         │  │    find_tables(vertical=lines,horizontal=lines)         │  │
+         │  │    → lines_table_rects  (reliable; can suppress visual) │  │
+         │  │                                                         │  │
+         │  │  Strategy 2 — whitespace word alignment    Phase 3B ✅  │  │
+         │  │    extract_words() → x0 cluster (30pt gap)             │  │
+         │  │    col consistency ≥40% · multi-line merge <8pt         │  │
+         │  │    CID artifact filter · rows[] pre-extracted           │  │
+         │  │    → soft_table_rects (heuristic; never suppress visual)│  │
+         │  │                                                         │  │
+         │  │  Strategy 3 — text+lines (after visual detect) 3C ✅   │  │
+         │  │    find_tables(vertical=text, horizontal=lines)         │  │
+         │  │    catches horizontal-separator-only tables             │  │
+         │  │    → soft_table_rects                                   │  │
+         │  │                                                         │  │
+         │  │  Validation (all strategies):                           │  │
+         │  │    ≥4 non-empty cells · not 1×1 · not all-prose        │  │
+         │  └─────────────────────────────────────────────────────────┘  │
+         │                                                               │
+         │  ┌─── STEP 2 — VISUAL DETECTION ──────────────────────────┐  │
+         │  │                                                         │  │
+         │  │  get_images(full=True)  → raster + Form XObjects        │  │
+         │  │  get_drawings()         → vector chart elements         │  │
+         │  │  _cluster_rects(gap=20) → merged visual regions         │  │
+         │  │                                                         │  │
+         │  │  Large cluster (>25% page):  Phase 3C ✅                │  │
+         │  │    _try_split_cluster() renders 0.5x thumbnail          │  │
+         │  │    finds whitespace bands (≥95% white rows/cols)        │  │
+         │  │    → splits into N distinct sub-region visual elements  │  │
+         │  │                                                         │  │
+         │  │  Discard check: visual cluster >70% inside              │  │
+         │  │    lines_table_rects ONLY (not soft_table_rects)        │  │
+         │  │                                                         │  │
+         │  │  Pixel fallback:               Phase 3B ✅              │  │
+         │  │    if covered_area <50% AND non_white >15%              │  │
+         │  │    AND text_ratio <0.5 → add full-page visual           │  │
+         │  └─────────────────────────────────────────────────────────┘  │
+         │                                                               │
+         │  ┌─── STEP 3 — TEXT BLOCK EXTRACTION ─────────────────────┐  │
+         │  │                                                         │  │
+         │  │  get_text("blocks") → filter:                           │  │
+         │  │    • center_y inside any table bbox → skip   Phase 3C ✅│  │
+         │  │    • overlap >50% with table bbox   → skip              │  │
+         │  │    • overlap >30% with visual bbox  → skip (caption)    │  │
+         │  │    remaining blocks → text_elements                     │  │
+         │  └─────────────────────────────────────────────────────────┘  │
+         │                                                               │
+         │  page_type derived from element presence:                     │
+         │    visual + anything  → mixed                                 │
+         │    visual only        → multimodal                            │
+         │    table + text       → mixed                                 │
+         │    table only         → table                                 │
+         │    text only          → text                                  │
+         │    nothing            → skip                                  │
+         │                                                               │
+         │  ┌─── STEP 4 — PER-ELEMENT CHUNKING + EMBEDDING ──────────┐  │
+         │  │                                                         │  │
+         │  │  TEXT elements                                          │  │
+         │  │    chunk_text_page(exclude_rects=table+visual bboxes)   │  │
+         │  │    → heading-bounded 500-800 token chunks               │  │
+         │  │    → embed 768-dim RETRIEVAL_DOCUMENT                   │  │
+         │  │                                                         │  │
+         │  │  TABLE elements                                         │  │
+         │  │    if elem has rows[] (whitespace/text+lines):          │  │
+         │  │      chunk_whitespace_table() → Markdown                │  │
+         │  │    else (pdfplumber lines):                             │  │
+         │  │      chunk_specific_table(table_index) → Markdown       │  │
+         │  │    CID artifact rejection on final markdown             │  │
+         │  │    → embed 768-dim RETRIEVAL_DOCUMENT                   │  │
+         │  │                                                         │  │
+         │  │  VISUAL elements                                        │  │
+         │  │    render_and_upload_visual_region(bbox)                │  │
+         │  │      2x zoom clip → PIL whitespace trim + 10px pad      │  │
+         │  │      → GCS: {doc_id}.{page} (v0)                       │  │
+         │  │              {doc_id}.{page}.v1 (v1) ... .vN            │  │
+         │  │    _find_caption_near_visual() → text within 25pt       │  │
+         │  │    Gemini 2.0 Flash describe_page_image(png_bytes)      │  │
+         │  │    caption + "\n\n" + gemini_description → chunk_text   │  │
+         │  │    → embed 768-dim RETRIEVAL_DOCUMENT                   │  │
+         │  └─────────────────────────────────────────────────────────┘  │
+         │                                                               │
+         │  Batch embed (gemini-embedding-001, output_dimensionality=768)│
+         │  Circuit breaker: 5 consecutive failures → text fallback      │
+         └──────────────────────┬──────────────────┬─────────────────────┘
+                                │                  │
+                     ┌──────────▼──────────┐  ┌───▼─────────────────────┐
+                     │  MongoDB            │  │  GCS (fake-gcs :4443)   │
+                     │                     │  │  bucket: rag-fl-documents│
+                     │  documents{}        │  │                         │
+                     │  page_profiles{}    │  │  {doc_id}.{page}        │
+                     │  doc_embeddings{}   │  │    first visual crop    │
+                     │    768-dim vectors  │  │  {doc_id}.{page}.v1     │
+                     │    gcs_image_path   │  │    second visual crop   │
+                     │    format_provenance│  │  {doc_id}.{page}.vN     │
+                     │  citation_cache{}   │  │    Nth visual crop      │
+                     │    TTL 1hr          │  │                         │
+                     └──────────┬──────────┘  └─────────────────────────┘
+                                │
+                                ▼
+         ┌───────────────────────────────────────────────────────────────┐
+         │                   Next.js UI                                  │
+         │                                      :3001  Phase 4 ✅        │
+         │                                                               │
+         │  ┌── LEFT PANEL ──────────────────────────────────────────┐  │
+         │  │  File list (EMBEDDED only)          Phase 4.1 ✅        │  │
+         │  │  + Upload → auto-process → poll → done toast            │  │
+         │  │  + ⊞ Compare button when ≥2 files share base name      │  │
+         │  │    (strips PureTable_/SS_/etc prefix → normalize)       │  │
+         │  └────────────────────────────────────────────────────────┘  │
+         │                                                               │
+         │  ┌── CENTER — PAGE EXPLORER ──────────────────────────────┐  │
+         │  │  Page rows: page_type badge + chunk count               │  │
+         │  │  Expand → ChunkCard per chunk:                          │  │
+         │  │    header:  [type badge] [📊 Visual?] Chunk N of M      │  │
+         │  │             section_title · 768-dim ✓                   │  │
+         │  │    sub-hdr: chunk_id (truncated, click-to-copy)         │  │
+         │  │    metadata (collapsible): full chunk_id, page,         │  │
+         │  │             section, format_provenance, bbox            │  │
+         │  │    content:                                             │  │
+         │  │      text chunk      → ReactMarkdown (headings/lists)   │  │
+         │  │      table chunk     → ReactMarkdown GFM table          │  │
+         │  │                        (borders, alternating rows)      │  │
+         │  │      multimodal      → PNG (gcsImageUrl → ?v=N)         │  │
+         │  │                        "Open full size ↗" link          │  │
+         │  │                        ReactMarkdown Gemini description  │  │
+         │  └────────────────────────────────────────────────────────┘  │
+         │                                                               │
+         │  ┌── CENTER — COMPARISON VIEW (when ⊞ Compare clicked) ───┐  │
+         │  │  N columns side-by-side, one per file in group          │  │
+         │  │  Column header: format badge + filename + fidelity tag  │  │
+         │  │    ≡ Full fidelity  (structured table extracted)        │  │
+         │  │    ▣ Vision description  (Gemini described screenshot)  │  │
+         │  │  Page navigation if multi-page docs                     │  │
+         │  │  Each column shows ChunkCards for current page          │  │
+         │  └────────────────────────────────────────────────────────┘  │
+         │                                                               │
+         │  ┌── RIGHT PANEL — SEARCH ────────────────────────────────┐  │
+         │  │  POST /search/within/{doc_id}                           │  │
+         │  │  Results: score bar + page badge + snippet + citation   │  │
+         │  │  Click → scroll + expand target page in center panel    │  │
+         │  └────────────────────────────────────────────────────────┘  │
+         └───────────────────────────────────────────────────────────────┘
+                                │
+                                ▼ (same :8004 FastAPI service)
+         ┌───────────────────────────────────────────────────────────────┐
+         │             Citation Engine  (citation.py router)             │
+         │                                      Phase 5 ✅               │
+         │  POST /citations/generate   {chunk_ids}                       │
+         │    → [{label, page, deep_link, chunk_type}]                   │
+         │    cache: MongoDB citation_cache{} TTL 1hr                    │
+         │                                                               │
+         │  GET  /citations/preview/{doc_id}/{page}                      │
+         │  GET  /provenance/document/{doc_id}                           │
+         │  GET  /provenance/chunk/{chunk_id}                            │
+         └───────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+         ┌───────────────────────────────────────────────────────────────┐
+         │           Search & Retrieval API  (search.py router)          │
+         │                                      Phase 6 ✅               │
+         │  POST /search                                                  │
+         │    query embed → RETRIEVAL_QUERY task_type                    │
+         │    filters: doc_ids, format, report_period, report_series     │
+         │    include_multimodal toggle                                   │
+         │    Redis cache SHA-256 keyed, TTL 1hr                         │
+         │                                                               │
+         │  POST /search/within/{doc_id}   (UI right panel)              │
+         │  GET  /document/{doc_id}/summary                              │
+         │                                                               │
+         │  Local:  cosine similarity (numpy)                            │
+         │  Prod:   Atlas $vectorSearch — zero code change               │
+         └───────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+         ┌───────────────────────────────────────────────────────────────┐
+         │  Phase 7 — Cloud Run deployment                    ⬜ TODO    │
+         │  ENVIRONMENT=production → Atlas URI + real GCS                │
+         │  Zero code changes — only .env values differ                  │
+         └───────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## UI Panel to API Mapping (Phase 4 + 4.1 + UI Enhancements)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    TOP BAR                                              │
+├────────────────────────────────────┬────────────────────────────────────┤
+│ UI Feature                         │ API / Logic                        │
+├────────────────────────────────────┼────────────────────────────────────┤
+│ FORCE_MIXED_MODE indicator         │ GET :8004/config                   │
+│ Current document name in breadcrumb│ client state only                  │
+└────────────────────────────────────┴────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    LEFT PANEL — File List                               │
+├────────────────────────────────────┬────────────────────────────────────┤
+│ UI Feature                         │ API / Logic                        │
+├────────────────────────────────────┼────────────────────────────────────┤
+│ Show EMBEDDED documents only       │ GET :8004/documents → filter       │
+│                                    │     status === "EMBEDDED"          │
+│ Upload file                        │ POST :8001/ingest                  │
+│ Auto-trigger processing            │ background task → POST :8004/      │
+│                                    │   process {doc_id}  (Phase 4.1)   │
+│ Poll upload status                 │ GET :8001/documents/{doc_id}       │
+│ Poll embedding completion          │ GET :8004/documents (by filename)  │
+│ Duplicate detection toast          │ POST :8001/ingest → is_duplicate   │
+│ Embedding complete toast           │ poll resolves status=EMBEDDED       │
+│ ⊞ Compare button (per group)       │ client-side: normalizeBaseName()   │
+│   appears when ≥2 files share      │   strips PureTable_/SS_/etc        │
+│   the same base filename           │   → detectComparisonGroups()       │
+└────────────────────────────────────┴────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│               CENTER PANEL — Page Explorer (normal mode)                │
+├────────────────────────────────────┬────────────────────────────────────┤
+│ UI Feature                         │ API / Logic                        │
+├────────────────────────────────────┼────────────────────────────────────┤
+│ Page list with type badges         │ GET :8004/document/{doc_id}/pages  │
+│ Expand page → ChunkCard per chunk  │ GET :8004/document/{doc_id}/       │
+│                                    │     chunks/{page_number}           │
+│ chunk_type badge (colored)         │ chunk.chunk_type from response     │
+│ "Chunk N of M" position label      │ chunk.chunk_index + count          │
+│ 📊 Visual badge                    │ keyword scan on chunk.chunk_text   │
+│ section_title display              │ chunk.section_title from response  │
+│ 768-dim ✓ indicator                │ chunk.embedding_dims from response │
+│ chunk_id (truncated, copy-to-clip) │ chunk.chunk_id from response       │
+│ ▼ Show metadata (collapsible)      │ chunk.format_provenance + bbox     │
+│ text chunk → ReactMarkdown         │ react-markdown + remark-gfm        │
+│ table chunk → HTML table grid      │ react-markdown GFM table renderer  │
+│   (borders, alternating rows,      │   mdTableComponents custom styles  │
+│    horizontal scroll if wide)      │                                    │
+│ multimodal → PNG image             │ GET :8004/image/{doc_id}/{page}    │
+│   correct crop per chunk           │     ?v=N  ← parsed from           │
+│   (gcsImageUrl() parses .v{n})     │     chunk.gcs_image_path .v{n}    │
+│ "Open full size ↗" link            │ same image URL, target=_blank      │
+│ Gemini description → ReactMarkdown │ chunk.chunk_text formatted         │
+└────────────────────────────────────┴────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│            CENTER PANEL — Comparison View (⊞ Compare mode)             │
+├────────────────────────────────────┬────────────────────────────────────┤
+│ UI Feature                         │ API / Logic                        │
+├────────────────────────────────────┼────────────────────────────────────┤
+│ N columns, one per file in group   │ GET :8004/document/{doc_id}/       │
+│ Each column shows page N chunks    │     chunks/{page_number}           │
+│   side-by-side simultaneously      │   called in parallel for all docs  │
+│ Format badge per column (XLSX/PDF) │ doc.original_format                │
+│ ≡ Full fidelity badge              │ no multimodal chunks in response   │
+│ ▣ Vision description badge         │ has multimodal chunk in response   │
+│ Page navigation (‹ ›)              │ re-fetches chunks for all docs     │
+│ ← Back to explorer button          │ client state: setCompareGroup(null)│
+│ ChunkCards same as normal mode     │ same rendering, same metadata      │
+└────────────────────────────────────┴────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    RIGHT PANEL — Search                                 │
+├────────────────────────────────────┬────────────────────────────────────┤
+│ UI Feature                         │ API / Logic                        │
+├────────────────────────────────────┼────────────────────────────────────┤
+│ Search within selected document    │ POST :8004/search/within/{doc_id}  │
+│ Score bar (0–100%)                 │ response → score (cosine)          │
+│ Page badge + chunk_type badge      │ response → page_number, chunk_type │
+│ Text snippet (3-line clamp)        │ response → chunk_text              │
+│ Citation label (filename · page)   │ client-side construction           │
+│ Click → scroll + expand page       │ client-side only (no API call)     │
+└────────────────────────────────────┴────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│          Backend-ready endpoints not yet exposed in UI                  │
+├────────────────────────────────────┬────────────────────────────────────┤
+│ Feature                            │ API                                │
+├────────────────────────────────────┼────────────────────────────────────┤
+│ Global cross-document search       │ POST :8004/search                  │
+│   with report_period filter        │   {query, filters: {report_period}}│
+│ Citation tooltip preview           │ GET :8004/citations/preview/       │
+│                                    │     {doc_id}/{page}                │
+│ Full document provenance trail     │ GET :8004/provenance/document/     │
+│                                    │     {doc_id}                       │
+│ Single chunk provenance            │ GET :8004/provenance/chunk/        │
+│                                    │     {chunk_id}                     │
+└────────────────────────────────────┴────────────────────────────────────┘
 ```
 
 ---
@@ -84,11 +363,12 @@ rag-fl/
 ├── Makefile
 ├── docker-compose.yml
 ├── services/
-│   ├── ingestion/          Phase 2 ✅ — Format Registry + file intake
-│   ├── rag-fl/             Phase 3   — Per-page analysis + embedding pipeline
-│   ├── ui/                 Phase 4   — Next.js observability interface
-│   ├── citation-engine/    Phase 5   — Provenance + citations
-│   └── search-api/         Phase 6   — Query + retrieval
+│   ├── ingestion/          Phase 2 ✅ — Format Registry + file intake + auto-trigger (Phase 4.1)
+│   ├── rag-fl/             Phase 3 ✅ — Per-page analysis + embedding pipeline
+│   │                       Phase 5 ✅ — Citation Engine (citation.py router)
+│   │                       Phase 6 ✅ — Search & Retrieval API (search.py router)
+│   └── ui/                 Phase 4 ✅ — Next.js observability interface
+│                           Phase 4.1 ✅ — Auto-process polling + EMBEDDED filter
 ├── shared/
 │   ├── schemas/            Canonical Chunk Schema (Pydantic)
 │   ├── contracts/          Inter-service API shapes
@@ -114,18 +394,26 @@ rag-fl/
 | Component | Technology | Reason |
 |---|---|---|
 | Vector Store | MongoDB Community (local) / Atlas (prod) | $vectorSearch on Atlas, cosine local |
-| Embeddings | Google text-embedding-004 (768 dim) | Asymmetric DOCUMENT/QUERY task types |
-| Vision | Gemini 1.5 Flash | Page description → text for embedding |
-| PDF | PyMuPDF + pdfplumber | Structure analysis + table extraction |
-| Image Analysis | Pillow | Free, local, no API cost |
+| Embeddings | **gemini-embedding-001** (768 dim) | Asymmetric DOCUMENT/QUERY task types. Deviation: originally text-embedding-004, but API key returned 404. gemini-embedding-001 produces identical 768-dim vectors. |
+| Vision | **Gemini 2.0 Flash** | Page description → text for embedding. Deviation: originally Gemini 1.5 Flash, but API key returned 404. Gemini 2.0 Flash has identical API + improved quality. |
+| PDF | PyMuPDF + pdfplumber | PyMuPDF: visual/text detection. pdfplumber: table extraction (3 strategies). |
+| Image Analysis | Pillow | Visual crop whitespace trimming (getbbox). Low-res thumbnail for pixel fallback and cluster splitting. |
 | Format Conversion | Gotenberg/LibreOffice | PPTX/DOCX → PDF |
-| Queue | Redis | Async workers + cache |
+| Queue/Cache | Redis | Search query cache (1hr TTL, SHA-256 keyed) |
 | Local GCS | fake-gcs-server | Identical API to real GCS |
-| Framework | FastAPI | Async, type-safe |
-| UI | Next.js + Tailwind | Observability interface |
+| Framework | FastAPI | Async, type-safe. Routers: citation.py (Phase 5), search.py (Phase 6) |
+| UI Framework | Next.js 14.2.30 + Tailwind CSS | Observability interface, `next dev` for Docker env var injection |
+| UI Markdown | react-markdown 8.0.7 + remark-gfm 3.0.1 | Renders chunk_text as formatted Markdown. GFM plugin enables table rendering. |
 | Container | Docker + docker-compose | Local = Production parity |
+| HTTP Client | httpx | Phase 4.1 auto-process background task |
 
-Not using: LangChain, LangGraph, batch orchestration (deferred).
+**Not using:** LangChain, LangGraph, batch orchestration (deferred to Harsh's production pipeline).
+
+**Model IDs:**
+```python
+EMBEDDING_MODEL = "models/gemini-embedding-001"
+VISION_MODEL = "gemini-2.0-flash"
+```
 
 ---
 
@@ -140,14 +428,16 @@ Not using: LangChain, LangGraph, batch orchestration (deferred).
 | Machine Learning in Detecting Fraud Literature Review.pdf | varies | text-heavy, some mixed, some table |
 
 ### Comparison Test Files (Harsh's request — table extraction accuracy)
-| File | Description | Purpose |
-|---|---|---|
-| CustomerChurn_Jan2025.xlsx | 15 customers, 10 cols, 3 sheets | Source of truth — native Excel extraction |
-| CustomerChurn_Jan2025 - Table.pdf | Same data copy-pasted as Word table → PDF | Test: pdfplumber structured extraction |
-| ChurnCustomer_Jan2025.pdf | Same data as screenshot image → PDF | Test: multimodal flow, Gemini Vision extraction |
+| File | Description | Extraction Path | UI fidelity badge |
+|---|---|---|---|
+| CustomerChurn_Jan2025.xlsx | Native Excel, 15 customers, 10 cols | openpyxl → Markdown table | ≡ Full fidelity |
+| PureTable_CustomerChurn_Jan2025.pdf | Same data as embedded PDF table | pdfplumber lines → Markdown table | ≡ Full fidelity |
+| SS_CustomerChurn_Jan2025.pdf | Same data as screenshot (image PDF) | Gemini Vision description | ▣ Vision description |
 
-The three files above must produce comparable embeddings despite different extraction paths.
-This validates that the pipeline handles all real-world table formats.
+The UI Comparison View auto-detects these as a group (base name `customerchurn_jan2025`
+after stripping `PureTable_` / `SS_` prefixes) and shows them side-by-side.
+All three produce 768-dim embeddings. Search quality is comparable — the screenshot
+path produces a text description that contains all column names and key values.
 
 ### Copy Sample Docs (Windows CMD)
 ```cmd
@@ -200,12 +490,15 @@ Fraud Review:   Mostly text | Some mixed | Some table
 
   # Content
   "chunk_type":      str,   # "text" | "table" | "multimodal"
-  "chunk_text":      str,   # Raw text, Markdown table, or Gemini Vision description
-  "gcs_image_path":  str,   # "gs://rag-fl-documents/{doc_id}.{page_number}" | None
+  "chunk_text":      str,   # Raw text, Markdown table, or caption + Gemini Vision description
+  "gcs_image_path":  str,   # "gs://rag-fl-documents/{doc_id}.{page_number}"      (first visual)
+                            # "gs://rag-fl-documents/{doc_id}.{page_number}.v1"   (second)
+                            # "gs://rag-fl-documents/{doc_id}.{page_number}.vN"   (Nth)
+                            # None for text and table chunks
 
   # Embedding
-  "embedding":           list[float],  # 768 dims, text-embedding-004
-  "embedding_model":     str,          # "models/text-embedding-004"
+  "embedding":           list[float],  # 768 dims, gemini-embedding-001
+  "embedding_model":     str,          # "models/gemini-embedding-001"
   "embedding_task_type": str,          # Always "RETRIEVAL_DOCUMENT" when storing
 
   # Timestamps
@@ -335,65 +628,123 @@ REGISTRY = {
 
 ---
 
-## Per-Page Classification Logic
+## Per-Page Classification Logic (classifier.py)
 
-Phase 3 only. Gemini Vision NOT called here — zero API cost.
+Zero Gemini API cost at classification stage.
 
 ```
 FORCE_MIXED_MODE=true  (env var, default: false)
-→ Skip all classification, treat ALL PDF pages as "mixed"
-→ Use for: development speed, small test docs, when Abhinav's suggestion needed
-→ Cost warning: every page triggers Gemini Vision + text embedding
+→ Skip all detection, mark ALL pages as "mixed"
+→ Every page gets Gemini Vision + text embedding (high API cost)
+→ Use only for quick local tests
 
-FORCE_MIXED_MODE=false (default for production)
-→ Run full classification pipeline below
+FORCE_MIXED_MODE=false (default — use always)
+→ Run full 4-step element detection below
 
-Layer 1 — PyMuPDF (every page, free):
-  text_ratio  = text block area / page area
-  image_ratio = image/drawing area / page area
+╔══════════════════════════════════════════════════════════════════════╗
+║  STEP 1 — TABLE DETECTION  (3 strategies + validation)              ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  Strategy 1 — pdfplumber LINES (Phase 3A)                           ║
+║    find_tables(vertical=lines, horizontal=lines)                     ║
+║    → lines_table_rects[]   reliable, can suppress visuals            ║
+║                                                                      ║
+║  Strategy 2 — whitespace word alignment (Phase 3B)                  ║
+║    extract_words(x_tolerance=3)                                      ║
+║    x0 cluster with 30pt gap → column centers                        ║
+║    consecutive lines merged if gap <8pt AND same columns             ║
+║    column consistency: each col appears in ≥40% of rows             ║
+║    CID artifact filter: skip rows with "(cid:" in any cell           ║
+║    → soft_table_rects[]    heuristic, never suppresses visuals       ║
+║                                                                      ║
+║  Strategy 3 — text+lines (Phase 3C, runs AFTER visual detect)       ║
+║    find_tables(vertical=text, horizontal=lines)                      ║
+║    catches horizontal-separator-only tables (no column borders)      ║
+║    skips any bbox overlapping a visual element (>40%)                ║
+║    → soft_table_rects[]                                              ║
+║                                                                      ║
+║  Validation (all strategies):                                        ║
+║    non_empty cells ≥ 4  ·  not 1×1  ·  not all-prose (>80c/cell)   ║
+║                                                                      ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  STEP 2 — VISUAL DETECTION  (Phase 3A + 3B + 3C)                    ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  get_images(full=True)  → raster images + XObject references        ║
+║  get_drawings()         → vector elements (axes, bars, pies)        ║
+║  _cluster_rects(gap=20) → merge nearby rects into visual regions    ║
+║                                                                      ║
+║  Discard: visual cluster >70% inside lines_table_rects ONLY         ║
+║  (soft tables from WS/text+lines never discard genuine visuals)      ║
+║                                                                      ║
+║  Large cluster (>25% page area):   _try_split_cluster()             ║
+║    renders 0.5x grayscale thumbnail of the cluster                   ║
+║    finds whitespace bands ≥2px, ≥95% white (row or column scan)     ║
+║    splits into N sub-rects, each ≥5% of page area                   ║
+║    → each sub-region becomes its own visual element                  ║
+║                                                                      ║
+║  Pixel fallback (when covered_area <50% of page):                   ║
+║    renders 0.25x grayscale thumbnail of full page                    ║
+║    if non_white >15% AND exceeds covered_area by >10%               ║
+║    AND text_ratio <0.5 → add full-page visual element                ║
+║    catches: Form XObjects, screenshots, missed vector content        ║
+║                                                                      ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  STEP 3 — TEXT BLOCK DETECTION  (Phase 3A + 3C)                     ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  get_text("blocks") → for each text block:                          ║
+║    SKIP if center_y is inside any table bbox (center-Y check)       ║
+║    SKIP if block overlaps >50% with any table bbox                   ║
+║    SKIP if block overlaps >30% with any visual bbox (caption rule)   ║
+║    otherwise → text_element                                          ║
+║                                                                      ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  PAGE TYPE DERIVATION  (from element presence)                       ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  visual + (table or text) → mixed                                    ║
+║  visual only              → multimodal                               ║
+║  table + text             → mixed                                    ║
+║  table only               → table                                    ║
+║  text only                → text                                     ║
+║  nothing detected         → skip                                     ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝
 
-  text_ratio > 0.70, image_ratio < 0.20   → "text"
-  image_ratio > 0.50, text_ratio < 0.20   → "multimodal"
-  text < 0.05 AND image < 0.05            → "skip"  (blank/dark cover)
-  both 0.20–0.70                          → Layer 2
-
-Layer 2 — Pillow (ambiguous pages only):
-  high color_variance   → "multimodal" (infographic/diagram)
-  high edge_density     → "multimodal" (line diagram/flow chart)
-  otherwise             → "mixed"
-
-Table override (runs after Layer 1):
-  pdfplumber detects ≥1 table → page_type = "table"  (overrides text/multimodal)
-
-Non-PDF logical pages:
-  Excel sheet  → "table"
+Non-PDF logical pages (classify_non_pdf):
+  Excel sheet  → "table"          (pdfplumber table extract path)
   YAML file    → "structured_text"
-  JPEG/PNG     → "multimodal"
+  JPEG/PNG     → "multimodal"     (Gemini Vision path)
 ```
 
 ---
 
-## Embedding Strategy — text-embedding-004
+## Embedding Strategy — gemini-embedding-001
 
 ### Asymmetric Task Types — MANDATORY, NEVER MIX
 
 ```python
 # Phase 3: storing chunks — ALWAYS RETRIEVAL_DOCUMENT
 result = genai.embed_content(
-    model="models/text-embedding-004",
+    model="models/gemini-embedding-001",
     content=chunk_text,
-    task_type="RETRIEVAL_DOCUMENT"
+    task_type="RETRIEVAL_DOCUMENT",
+    output_dimensionality=768  # explicit 768-dim
 )
 
 # Phase 6: user query — ALWAYS RETRIEVAL_QUERY
 result = genai.embed_content(
-    model="models/text-embedding-004",
+    model="models/gemini-embedding-001",
     content=user_query,
-    task_type="RETRIEVAL_QUERY"
+    task_type="RETRIEVAL_QUERY",
+    output_dimensionality=768
 )
 ```
 
-Using same task_type for both degrades retrieval quality significantly. This is asymmetric by design.
+**Using same task_type for both degrades retrieval quality significantly.** This is asymmetric by design.
+
+**Model deviation note:** Originally specified `text-embedding-004`, but API key returned 404. Switched to `gemini-embedding-001` which produces identical 768-dim vectors with same task_type support. Zero code changes required for future migration back to text-embedding-004.
 
 ---
 
@@ -437,11 +788,22 @@ Migration to Atlas (Phase 7): set ENVIRONMENT=production, create Atlas index. Ze
 /input/                  ← Drop files here (Windows bind mount)
 /output/
   ├── embedding-db/      ← Embedding artifacts
-  └── flat-images/       ← Rendered page PNGs before GCS upload
+  └── flat-images/       ← Rendered visual crop PNGs before GCS upload
                             naming: {doc_id}_page_{page_number}.png
+                                    {doc_id}_page_{page_number}.v1.png
+                                    {doc_id}_page_{page_number}.v2.png  ...
 
 GCS bucket:  rag-fl-documents
-GCS key:     {doc_id}.{page_number}    e.g. a3f9c2b1.12
+GCS keys:
+  Source file:           {doc_id}/{filename}
+  First visual per page: {doc_id}.{page_number}          ← backward compat
+  Second visual:         {doc_id}.{page_number}.v1
+  Third visual:          {doc_id}.{page_number}.v2
+  Nth visual:            {doc_id}.{page_number}.v{N-1}
+
+  The .v{n} suffix is parsed by gcsImageUrl() in the UI to route
+  GET /image/{doc_id}/{page}?v=N to the correct crop.
+  v=0 (default, no param) → first crop; v=1 → second; v=N → Nth.
 ```
 
 ---

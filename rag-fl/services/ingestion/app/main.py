@@ -11,7 +11,9 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Header
+import httpx
+from fastapi import BackgroundTasks, FastAPI, File, UploadFile, HTTPException, Query, Header
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -76,7 +78,37 @@ app = FastAPI(
     description="Format-agnostic file intake. Handles PDF, Excel, PPTX, DOCX, YAML, JPEG, PNG.",
     lifespan=lifespan,
 )
+# CORS_ORIGINS can be comma-separated list for production
+_cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3001,http://127.0.0.1:3001").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 app.include_router(webhooks_router)
+
+
+# ── Background pipeline trigger ───────────────────────────────────────────────
+
+PIPELINE_URL = os.getenv("PIPELINE_URL", "http://rag-fl:8004")
+
+async def trigger_pipeline_processing(doc_id: str) -> None:
+    """Call rag-fl /process. On failure, rollback the document from MongoDB."""
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                f"{PIPELINE_URL}/process",
+                json={"doc_id": doc_id, "dry_run": False},
+            )
+            resp.raise_for_status()
+            logger.info(f"Auto-process succeeded for doc_id={doc_id}")
+    except Exception as e:
+        logger.error(f"Auto-process failed for doc_id={doc_id}: {e} — rolling back")
+        db = get_documents_collection().database
+        db.documents.delete_one({"doc_id": doc_id})
+        db.page_profiles.delete_many({"doc_id": doc_id})
+        db.doc_embeddings.delete_many({"doc_id": doc_id})
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -90,6 +122,7 @@ async def health():
 
 @app.post("/ingest")
 async def ingest(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     dry_run: bool = Query(False, description="If true, return estimates without saving anything"),
     source_channel: str = Query("manual_upload", description="manual_upload | folder_watcher | onedrive"),
@@ -210,6 +243,10 @@ async def ingest(
     except Exception as e:
         logger.error(f"MongoDB insert failed for {filename}: {e}")
         raise HTTPException(status_code=500, detail=f"MongoDB insert failed: {e}")
+
+    # Auto-trigger pipeline processing in background
+    background_tasks.add_task(trigger_pipeline_processing, doc_id)
+    logger.info(f"Queued auto-process for doc_id={doc_id}")
 
     return IngestResponse(
         doc_id=doc_id,

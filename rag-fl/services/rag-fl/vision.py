@@ -16,7 +16,7 @@ _DESCRIPTION_PROMPT = (
     "Describe this page comprehensively: what is shown, key numbers and labels, "
     "relationships between elements, any data trends visible."
 )
-_MODEL = "gemini-2.0-flash"
+_MODEL = os.getenv("VISION_MODEL", "gemini-2.0-flash")
 
 # Circuit breaker state
 _failure_count = 0

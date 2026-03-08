@@ -17,7 +17,7 @@ from google.genai import types
 logger = logging.getLogger("ragfl.embedder")
 
 # gemini-embedding-001 supports output_dimensionality=768 (matching MongoDB index)
-_MODEL = "models/gemini-embedding-001"
+_MODEL = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
 _DIMS = 768
 _BATCH_SIZE = 100  # group for logging only; API called per-item
 
