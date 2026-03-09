@@ -170,6 +170,7 @@ services:
       - DRY_RUN_THRESHOLD=${DRY_RUN_THRESHOLD}
       - FORCE_MIXED_MODE=${FORCE_MIXED_MODE}
       - OUTPUT_DIR=/output
+      - SEED_FILES=${SEED_FILES:-tests/sample-docs/CustomerChurn_Jan2025.xlsx,tests/sample-docs/PureTable_CustomerChurn_Jan2025.pdf,tests/sample-docs/SS_CustomerChurn_Jan2025.pdf}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
       interval: 10s

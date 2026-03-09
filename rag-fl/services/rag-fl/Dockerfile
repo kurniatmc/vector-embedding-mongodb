@@ -10,9 +10,10 @@ RUN apt-get update && apt-get install -y \
 COPY services/rag-fl/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Copy shared utilities and the service
+# Copy shared utilities, the service, and seed test files
 COPY shared/ ./shared/
 COPY services/rag-fl/ ./services/rag-fl/
+COPY tests/ ./tests/
 
 # PYTHONPATH: project root (for shared.*) + service dir (for classifier, chunker, etc.)
 ENV PYTHONPATH=/app/services/rag-fl:/app

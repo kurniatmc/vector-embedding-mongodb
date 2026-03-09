@@ -494,17 +494,31 @@ def _try_split_cluster(
     fitz_page,
     cluster: fitz.Rect,
     page_area: float,
-    split_threshold: float = 0.25,
+    split_threshold: float = 0.40,
     min_sub_ratio: float = 0.05,
+    min_band_width: int = 10,
 ) -> list:
     """
     For large visual clusters (> split_threshold of page area), attempt to find
     natural whitespace bands (rows or columns that are ≥95% white) and split there.
     Returns list of sub-Rects if a clean split is found, else [cluster] unchanged.
     Any sub-rect below min_sub_ratio of page area is discarded.
+
+    Increased split_threshold to 0.40 (40% page) to avoid splitting bar charts.
+    min_band_width=10 prevents splitting on thin bar spacing.
     """
     if cluster.get_area() / max(page_area, 1) < split_threshold:
         return [cluster]
+
+    # Aspect ratio guard: don't split reasonable chart dimensions
+    # Typical charts: landscape (2:1) to portrait (1:2)
+    width = cluster.x1 - cluster.x0
+    height = cluster.y1 - cluster.y0
+    if height > 0:
+        aspect_ratio = width / height
+        if 0.4 <= aspect_ratio <= 3.0:
+            # Reasonable single-chart aspect ratio → don't split
+            return [cluster]
     try:
         scale = 0.5
         pix = fitz_page.get_pixmap(
@@ -527,8 +541,8 @@ def _try_split_cluster(
         col = [samples[r * w + j] for r in range(h)]
         return sum(b > 240 for b in col) / h > 0.95 if h else True
 
-    def _find_splits(is_white_fn, size: int):
-        """Find midpoints of white bands (≥2 pixels wide) between content."""
+    def _find_splits(is_white_fn, size: int, min_width: int):
+        """Find midpoints of white bands (≥min_width pixels wide) between content."""
         in_band = False
         band_start = 0
         splits: list[float] = []
@@ -537,7 +551,7 @@ def _try_split_cluster(
                 band_start = i
                 in_band = True
             elif not is_white_fn(i) and in_band:
-                if i - band_start >= 2:
+                if i - band_start >= min_width:
                     splits.append((band_start + i) / 2)
                 in_band = False
         return splits
@@ -555,7 +569,7 @@ def _try_split_cluster(
         return subs
 
     # Try horizontal split first
-    h_splits = _find_splits(_row_white, h)
+    h_splits = _find_splits(_row_white, h, min_band_width)
     if h_splits:
         subs = _build_sub_rects(h_splits, cluster.y0, cluster.y1, scale, True)
         if len(subs) > 1:
@@ -563,7 +577,7 @@ def _try_split_cluster(
             return subs
 
     # Try vertical split
-    v_splits = _find_splits(_col_white, w)
+    v_splits = _find_splits(_col_white, w, min_band_width)
     if v_splits:
         subs = _build_sub_rects(v_splits, cluster.x0, cluster.x1, scale, False)
         if len(subs) > 1:

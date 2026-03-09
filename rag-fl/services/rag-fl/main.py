@@ -24,9 +24,12 @@ Search endpoints (search.py router — Phase 6):
   POST /search/within/{doc_id}                 → document-scoped search
   GET  /document/{doc_id}/summary              → doc stats + page-type breakdown
 """
+import asyncio
+import hashlib
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
@@ -249,3 +252,60 @@ async def get_config():
         "environment": os.getenv("ENVIRONMENT", "development"),
         "dry_run_threshold": int(os.getenv("DRY_RUN_THRESHOLD", "10")),
     }
+
+
+# ── Startup seeding (Problem 3) ───────────────────────────────────────────────
+
+_DEFAULT_SEED_FILES = [
+    "tests/sample-docs/CustomerChurn_Jan2025.xlsx",
+    "tests/sample-docs/PureTable_CustomerChurn_Jan2025.pdf",
+    "tests/sample-docs/SS_CustomerChurn_Jan2025.pdf",
+]
+
+
+async def _run_seeding(comparison_files: list[str]) -> None:
+    """Background coroutine: ingest + embed each seed file if not already EMBEDDED."""
+    from pipeline import ingest_file_direct, process_by_doc_id
+
+    for file_path_str in comparison_files:
+        path = Path(file_path_str)
+        if not path.exists():
+            logger.warning(f"Seed file not found: {file_path_str}")
+            continue
+        try:
+            file_bytes = path.read_bytes()
+            content_hash = hashlib.sha256(file_bytes).hexdigest()
+            existing = get_documents_col().find_one(
+                {"content_hash": content_hash, "status": "EMBEDDED"}, {"doc_id": 1}
+            )
+            if existing:
+                logger.info(f"Seed skip (already embedded): {path.name}")
+                continue
+            logger.info(f"Seed start: {path.name}")
+            doc_id, *_ = await asyncio.to_thread(ingest_file_direct, path)
+            await asyncio.to_thread(process_by_doc_id, doc_id, False, True)
+            logger.info(f"Seed complete: {path.name}")
+        except Exception as e:
+            logger.error(f"Seed failed for {path.name}: {e}")
+
+
+@app.on_event("startup")
+async def seed_comparison_files() -> None:
+    """
+    Auto-ingest and embed comparison files if not already EMBEDDED.
+    File paths from SEED_FILES env var (comma-separated).
+    SEED_FILES= (empty string) → skip seeding entirely.
+    Runs in background — does not block service startup or health check.
+    """
+    seed_env = os.getenv("SEED_FILES")
+
+    if seed_env is not None and seed_env.strip() == "":
+        logger.info("Seed: SEED_FILES is empty — skipping seeding")
+        return
+
+    if seed_env:
+        comparison_files = [p.strip() for p in seed_env.split(",") if p.strip()]
+    else:
+        comparison_files = _DEFAULT_SEED_FILES
+
+    asyncio.create_task(_run_seeding(comparison_files))
