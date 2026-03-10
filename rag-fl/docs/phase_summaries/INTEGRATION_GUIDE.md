@@ -1,6 +1,6 @@
 # RAG-FL Integration Guide
-**Version:** 6.0.0
-**Last Updated:** 2026-03-08
+**Version:** 6.1.0
+**Last Updated:** 2026-03-10
 **Target Audience:** Developers integrating with RAG-FL system
 
 ---
@@ -668,15 +668,25 @@ for doc_path in DOCS_DIR.glob("*.pdf"):
 {
   doc_id: "UUID",
   page_number: 1,
+  page_type: "text|table|multimodal|mixed|full_page_image|skip",  // NEW: Phase 3F
   detected_elements: [
     {type: "table", bbox: [x0,y0,x1,y1], table_index: 0},
     {type: "visual", bbox: [x0,y0,x1,y1]},
-    {type: "text", bbox: [x0,y0,x1,y1], char_count: 500}
+    {type: "text", bbox: [x0,y0,x1,y1], char_count: 500},
+    {type: "full_page_image", bbox: [0,0,width,height]}  // NEW: entire page
   ],
   needs_vision_retry: false,
   created_at: ISODate
 }
 ```
+
+**Page Types:**
+- `text` - Pure text page
+- `table` - Table-only page
+- `multimodal` - Single visual/chart
+- `mixed` - Multiple element types (text + table, etc.)
+- `full_page_image` (**NEW**) - Complex mixed content captured as single full-page image
+- `skip` - No extractable content
 
 **Collection: `doc_embeddings`**
 ```javascript
@@ -684,16 +694,18 @@ for doc_path in DOCS_DIR.glob("*.pdf"):
   chunk_id: "UUID",
   doc_id: "UUID",
   page_number: 1,
-  bounding_box: {x0, y0, x1, y1} | null,
+  bounding_box: {x0, y0, x1, y1} | null,  // null for full_page_image
   section_title: "string",
   chunk_index: 0,
   format_provenance: {
     original_format: "pdf",
-    table_index: 0  // for tables
+    table_index: 0,     // for tables
+    visual_index: 0,    // for visuals
+    is_full_page: true  // NEW: for full_page_image chunks
   },
   chunk_type: "text|table|multimodal",
-  chunk_text: "string",
-  gcs_image_path: "gs://bucket/doc_id.page" | null,
+  chunk_text: "string",  // Gemini description for multimodal (including full_page)
+  gcs_image_path: "gs://bucket/doc_id.page" | null,  // Present for full_page_image
   embedding: [768 floats],
   embedding_model: "models/gemini-embedding-001",
   embedding_task_type: "RETRIEVAL_DOCUMENT",
@@ -701,6 +713,13 @@ for doc_path in DOCS_DIR.glob("*.pdf"):
   updated_at: ISODate
 }
 ```
+
+**Full-Page Image Schema (Phase 3F):**
+- `chunk_type` = `"multimodal"`
+- `gcs_image_path` = `"gs://rag-fl-documents/{doc_id}.{page_number}"` (full page capture)
+- `chunk_text` = Comprehensive Gemini Vision description of entire page
+- `bounding_box` = `null` (entire page, no bbox clip)
+- `format_provenance.is_full_page` = `true`
 
 **Collection: `citation_cache`** (TTL 1 hour)
 ```javascript
@@ -1074,6 +1093,48 @@ For integration support, refer to project documentation or reach out to the deve
 
 ---
 
-**Document Version:** 1.0
-**Generated:** 2026-03-08
-**System Version:** 6.0.0
+## 11. Recent Updates & Roadmap
+
+### Phase 3F (2026-03-10) - Full-Page-as-Image ✅
+
+**Problem:** Complex mixed pages (table with invisible borders + charts) hard to parse element-by-element
+
+**Solution:** Capture entire page as single high-res image, Gemini Vision describes full context
+
+**Implementation:**
+- **Classifier:** Detects `page_type="full_page_image"` when table + visual OR complex mixed
+- **Chunker:** `chunk_full_page_image()` renders full page at 3x zoom, uploads to GCS
+- **Gemini Prompt:** "Describe this entire page in detail. Include all text content, tables (with data), charts, diagrams, and their relationships."
+- **Result:** Single multimodal chunk with comprehensive description + full-page image
+
+**Benefits:**
+- Simplifies parsing complex layouts
+- LLM gets complete page context during retrieval (not fragmented elements)
+- Reduces edge cases (invisible table borders, merged cells, etc.)
+
+**Example:**
+- **Before:** Titanic page 5 → 3 chunks (table bbox, chart bbox, text bbox) - fragmented
+- **After:** Titanic page 5 → 1 chunk (full page image + holistic Gemini description)
+
+---
+
+### Next Phase - Format Expansion & Integration
+
+**Pending Tasks:**
+1. **markitdown Integration** - Excel direct reading (no PDF conversion, supports multi-sheet)
+2. **Image Format Support** - Test PNG, JPEG uploads (already coded, needs verification)
+3. **YAML Format Support** - Test YAML uploads
+4. **Ahmad Integration** - Connect as pluggable RAG tool, golden dataset evaluation
+5. **Schema Sync** - Coordinate MongoDB schema changes with Ahmad's pipeline
+
+**Production Readiness:**
+- Phase 7: Cloud Run deployment
+- MongoDB Atlas $vectorSearch index
+- Real GCS bucket (replace fake-gcs)
+- API authentication & rate limiting
+
+---
+
+**Document Version:** 1.1
+**Generated:** 2026-03-10
+**System Version:** 6.1.0

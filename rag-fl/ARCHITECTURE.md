@@ -1,6 +1,6 @@
 # RAG-FL System Architecture
 > **Claude Code Context File** — Read this file COMPLETELY at the start of every session before writing any code.
-> Last updated: 2026-03-08 — Phases 3B, 3C, and UI (Phase 4 enhancements) complete
+> Last updated: 2026-03-10 — Phase 3F (Full-Page-as-Image) complete
 
 ---
 
@@ -667,48 +667,124 @@ FORCE_MIXED_MODE=false (default — use always)
 ║    non_empty cells ≥ 4  ·  not 1×1  ·  not all-prose (>80c/cell)   ║
 ║                                                                      ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║  STEP 2 — VISUAL DETECTION  (Phase 3A + 3B + 3C)                    ║
+║  STEP 2 — VISUAL DETECTION  (Phase 3D — REWRITTEN 2026-03-10)       ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║                                                                      ║
-║  get_images(full=True)  → raster images + XObject references        ║
-║  get_drawings()         → vector elements (axes, bars, pies)        ║
-║  _cluster_rects(gap=20) → merge nearby rects into visual regions    ║
+║  Step 2A — IMAGE XOBJECTS (no clustering, each separate)            ║
+║    get_images(full=True) → raster images + XObject references       ║
+║    Filter: area >= 0.5% of page (_MIN_IMAGE_AREA_RATIO)             ║
+║    Filter: not >70% inside lines_table_rects                         ║
+║    → Each XObject becomes SEPARATE visual element                    ║
+║    (prevents merging distinct images like pivot tables + charts)     ║
 ║                                                                      ║
-║  Discard: visual cluster >70% inside lines_table_rects ONLY         ║
-║  (soft tables from WS/text+lines never discard genuine visuals)      ║
+║  Step 2B — VECTOR DRAWINGS (gap-cluster + dedupe against images)    ║
+║    get_drawings() → vector elements (axes, bars, pies)              ║
+║    _cluster_rects(gap=20pt) → merge drawing paths into chart regions║
+║    Filter: area >= 3% of page (_MIN_VISUAL_AREA_RATIO)              ║
+║    Dedupe: skip if cluster >70% covered by image XObject            ║
+║    → Prevents double-detection (chart drawing inside image bbox)     ║
 ║                                                                      ║
-║  Large cluster (>25% page area):   _try_split_cluster()             ║
-║    renders 0.5x grayscale thumbnail of the cluster                   ║
-║    finds whitespace bands ≥2px, ≥95% white (row or column scan)     ║
-║    splits into N sub-rects, each ≥5% of page area                   ║
-║    → each sub-region becomes its own visual element                  ║
+║  Step 2B' — PIXEL FALLBACK (when covered_area <50% of page)         ║
+║    Renders 0.25x grayscale thumbnail of full page                    ║
+║    if non_white >20% (was 15%, Phase 3E fix)                        ║
+║    AND exceeds covered_area by >10%                                  ║
+║    AND text_ratio <0.5                                               ║
+║    → add full-page visual element                                    ║
+║    Catches: Form XObjects, screenshots, missed vector content        ║
 ║                                                                      ║
-║  Pixel fallback (when covered_area <50% of page):                   ║
-║    renders 0.25x grayscale thumbnail of full page                    ║
-║    if non_white >15% AND exceeds covered_area by >10%               ║
-║    AND text_ratio <0.5 → add full-page visual element                ║
-║    catches: Form XObjects, screenshots, missed vector content        ║
+║  Architectural Change (Phase 3D):                                    ║
+║    Before: combined pool → cluster → try_split_cluster               ║
+║    After:  images separate | drawings cluster → dedupe               ║
+║    Result: Each PDF image XObject preserved as individual element    ║
 ║                                                                      ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║  STEP 3 — TEXT BLOCK DETECTION  (Phase 3A + 3C)                     ║
+║  STEP 3 — TEXT BLOCK DETECTION  (Phase 3E — FIXED 2026-03-10)       ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║                                                                      ║
 ║  get_text("blocks") → for each text block:                          ║
-║    SKIP if center_y is inside any table bbox (center-Y check)       ║
-║    SKIP if block overlaps >50% with any table bbox                   ║
-║    SKIP if block overlaps >30% with any visual bbox (caption rule)   ║
-║    otherwise → text_element                                          ║
+║    Filter: char_count > 20 (was 50, Phase 3E — captures subtitles)  ║
+║    Exclude from text_elements list:                                  ║
+║      - center_y inside any table/visual bbox                         ║
+║      - overlap >50% with any table bbox                              ║
+║      - overlap >30% with any visual bbox (caption rule)              ║
+║                                                                      ║
+║  Chunker exclude_rects logic (Phase 3E fix):                         ║
+║    OLD (OR logic): skip if center inside OR overlap >40%             ║
+║    NEW (AND logic): skip ONLY if center inside AND overlap >70%      ║
+║    → Paragraphs near tables no longer excluded                       ║
+║                                                                      ║
+║  Pipeline exclude_bboxes (Phase 3E fix):                             ║
+║    Include: LINES-strategy tables + all visuals                      ║
+║    Exclude: soft tables (whitespace, text+lines)                     ║
+║    → Soft table bboxes don't suppress neighboring text               ║
 ║                                                                      ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  PAGE TYPE DERIVATION  (from element presence)                       ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║                                                                      ║
-║  visual + (table or text) → mixed                                    ║
-║  visual only              → multimodal                               ║
-║  table + text             → mixed                                    ║
-║  table only               → table                                    ║
-║  text only                → text                                     ║
-║  nothing detected         → skip                                     ║
+║  full_page_image (Phase 3F) → capture entire page (see below)       ║
+║  visual + (table or text)   → mixed                                  ║
+║  visual only                → multimodal                             ║
+║  table + text               → mixed                                  ║
+║  table only                 → table                                  ║
+║  text only                  → text                                   ║
+║  nothing detected           → skip                                   ║
+║                                                                      ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  PHASE 3F — FULL-PAGE-AS-IMAGE  (2026-03-10)                        ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  Harsh's Directive (from meeting 2026-03-10):                        ║
+║    "Wherever there is a table and image, just take the whole page    ║
+║     as an image and embed it. When we are asking the question, we    ║
+║     will retrieve the page and pass the same page in the context     ║
+║     also. So that LLM will have the full understanding."             ║
+║                                                                      ║
+║  Trigger Conditions:                                                 ║
+║    IF (has_table AND has_visual) OR complex_mixed_content            ║
+║    → page_type = "full_page_image"                                   ║
+║                                                                      ║
+║  Processing:                                                         ║
+║    1. classifier.py: set page_type="full_page_image"                 ║
+║       detected_elements = [{"type":"full_page_image","bbox":full}]   ║
+║                                                                      ║
+║    2. chunker.py: chunk_full_page_image()                            ║
+║       - Render FULL PAGE at 3x zoom (high quality)                   ║
+║       - Upload to GCS: {doc_id}.{page_number} (no .fullpage suffix)  ║
+║       - Gemini Vision prompt: "Describe this entire page in detail.  ║
+║         Include all text content, tables (with data), charts,        ║
+║         diagrams, and their relationships."                          ║
+║       - Return single ChunkRecord:                                   ║
+║         * chunk_type = "multimodal"                                  ║
+║         * chunk_text = comprehensive Gemini description              ║
+║         * gcs_image_path = gs://bucket/{doc_id}.{page_number}        ║
+║         * bounding_box = null (entire page)                          ║
+║         * format_provenance.is_full_page = true                      ║
+║                                                                      ║
+║    3. pipeline.py: element dispatch                                  ║
+║       IF element["type"] == "full_page_image":                       ║
+║         chunks.append(chunk_full_page_image(...))                    ║
+║         break  # skip other element processing for this page         ║
+║                                                                      ║
+║  Problem Solved:                                                     ║
+║    Page 5 Titanic: table with invisible borders + bar chart          ║
+║    Before: 3 fragmented chunks (table, chart, text) — hard to parse  ║
+║    After:  1 holistic chunk (full page) — LLM sees complete context  ║
+║                                                                      ║
+║  Benefits:                                                           ║
+║    - Simplifies complex layout parsing (invisible table borders)     ║
+║    - LLM gets complete page context during retrieval                 ║
+║    - Reduces edge cases (merged cells, nested tables, etc.)          ║
+║    - Single Gemini call vs multiple element calls                    ║
+║                                                                      ║
+║  Example Output (MongoDB doc_embeddings):                            ║
+║    chunk_type: "multimodal"                                          ║
+║    chunk_text: "This page shows customer churn analysis with a       ║
+║                 table listing 15 customers (ID, Name, Plan, Churn    ║
+║                 Status, Reason) and a bar chart below visualizing    ║
+║                 churn counts by subscription plan..."                ║
+║    gcs_image_path: "gs://rag-fl-documents/{doc_id}.5"                ║
+║    format_provenance.is_full_page: true                              ║
 ║                                                                      ║
 ╚══════════════════════════════════════════════════════════════════════╝
 

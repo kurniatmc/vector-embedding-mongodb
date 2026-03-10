@@ -1,5 +1,5 @@
 # RAG-FL API Quick Reference Card
-**Version:** 6.0.0 | **Last Updated:** 2026-03-08
+**Version:** 6.1.0 | **Last Updated:** 2026-03-10
 
 ---
 
@@ -256,11 +256,22 @@ curl http://localhost:8004/provenance/chunk/e5707f3b-331e-4e36-8fd5-b3f858193dfc
 
 ## Chunk Types
 
-| Type | Description | Example |
-|------|-------------|---------|
-| **text** | Plain text chunks | Paragraphs, narrative sections |
-| **table** | Extracted as markdown table | Tabular data from PDF/Excel |
-| **multimodal** | Gemini Vision description + image | Charts, graphs, screenshots |
+| Type | Description | Example | Notes |
+|------|-------------|---------|-------|
+| **text** | Plain text chunks | Paragraphs, narrative sections | Element-based extraction |
+| **table** | Extracted as markdown table | Tabular data from PDF/Excel | Element-based extraction |
+| **multimodal** | Gemini Vision description + image | Charts, graphs, screenshots | Includes full-page images (Phase 3F) |
+
+## Page Types (Classifier Output)
+
+| Type | Trigger | Processing |
+|------|---------|------------|
+| **text** | Pure text page | chunk_text_page() |
+| **table** | Table-only page | chunk_specific_table() |
+| **multimodal** | Image/chart only | render_and_upload_visual_region() |
+| **mixed** | Text + table | Element-based dispatch |
+| **full_page_image** | Table + visual OR complex mixed | **NEW (Phase 3F):** Entire page → single Gemini Vision call |
+| **skip** | No extractable content | No chunks created |
 
 ---
 
@@ -421,5 +432,25 @@ open http://localhost:3001
 
 ---
 
-**Quick Reference Version:** 1.0
-**Generated:** 2026-03-08
+## Recent Updates (Phase 3F - 2026-03-10)
+
+### Full-Page-as-Image Strategy
+**Trigger:** Pages with `table + visual` OR complex mixed content
+**Behavior:** Capture entire page as single high-res image (3x zoom)
+**Gemini Call:** Single vision call describes full page context
+**Schema:** `chunk_type="multimodal"`, `gcs_image_path="{doc_id}.{page_number}"`
+**Rationale:** Simplifies parsing complex layouts, LLM gets complete page context during retrieval
+
+**Example:**
+- **Before:** Page 5 → 3 chunks (table bbox, chart bbox, text bbox)
+- **After:** Page 5 → 1 chunk (full page image + comprehensive Gemini description)
+
+### Next Steps (Pending)
+- [ ] Excel direct reading (markitdown package - no PDF conversion)
+- [ ] PNG/JPEG/YAML format support testing
+- [ ] Ahmad integration (RAG tooling, golden dataset evaluation)
+
+---
+
+**Quick Reference Version:** 1.1
+**Generated:** 2026-03-10

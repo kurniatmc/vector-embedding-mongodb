@@ -69,17 +69,25 @@ def chunk_text_page(
             cx = (block[0] + block[2]) / 2
             cy = (block[1] + block[3]) / 2
             center_pt = fitz.Point(cx, cy)
-            # Exclude if center is inside any excluded rect
-            if any(er.contains(center_pt) for er in ex_fitz):
-                continue
-            # Also exclude by overlap ratio
             br = fitz.Rect(block[:4])
             br_area = br.get_area()
-            if br_area > 0 and any(
-                (br & er).get_area() / br_area > 0.4 for er in ex_fitz
-            ):
-                continue
-            kept.append(block[4])
+            # Exclude only if BOTH center is inside AND overlap > 70%.
+            # Using OR (old logic) was too aggressive and suppressed legitimate
+            # paragraphs/subtitles that are near but outside table/visual bboxes.
+            skip = False
+            for er in ex_fitz:
+                if not er.contains(center_pt):
+                    continue
+                overlap = 0.0
+                if br_area > 0:
+                    inter = br & er
+                    if not inter.is_empty:
+                        overlap = inter.get_area() / br_area
+                if overlap > 0.7:
+                    skip = True
+                    break
+            if not skip:
+                kept.append(block[4])
         full_text = "\n".join(kept)
     else:
         full_text = fitz_page.get_text()
@@ -324,6 +332,65 @@ def render_and_upload_multimodal(
         gcs_image_path=gcs_image_path,
         embedding=None,
         embedding_model="models/gemini-embedding-001",
+        embedding_task_type="RETRIEVAL_DOCUMENT",
+    )
+    return chunk, png_bytes
+
+
+def chunk_full_page_image(
+    fitz_doc: fitz.Document,
+    page_number: int,
+    doc_id: str,
+    original_format: str,
+    chunk_index: int = 0,
+) -> tuple[Optional[ChunkRecord], Optional[bytes]]:
+    """
+    Render the entire page at 2x zoom and upload to GCS as a full-page image.
+    Used for full_page_image pages (mixed content: table + visual, multi-visual, etc.)
+
+    GCS key: {doc_id}.{page_number}.fullpage
+    Returns (ChunkRecord with empty chunk_text, png_bytes).
+    chunk_text must be filled by vision.describe_full_page() in pipeline.py.
+    """
+    output_dir = os.getenv("OUTPUT_DIR", "/output")
+    gcs_bucket = os.getenv("GCS_BUCKET", "rag-fl-documents")
+
+    try:
+        fitz_page = fitz_doc[page_number - 1]
+        mat = fitz.Matrix(2, 2)
+        pix = fitz_page.get_pixmap(matrix=mat)
+
+        flat_dir = Path(output_dir) / "flat-images"
+        flat_dir.mkdir(parents=True, exist_ok=True)
+        out_path = flat_dir / f"{doc_id}_page_{page_number}_fullpage.png"
+        pix.save(str(out_path))
+
+        png_bytes = pix.tobytes("png")
+        del pix
+    except Exception as e:
+        logger.error(f"Full-page render failed page {page_number}: {e}")
+        return None, None
+
+    gcs_key = f"{doc_id}.{page_number}"
+    gcs_image_path = None
+    try:
+        upload_bytes(png_bytes, gcs_key, content_type="image/png")
+        gcs_image_path = f"gs://{gcs_bucket}/{gcs_key}"
+    except Exception as e:
+        logger.error(f"GCS upload failed for full-page image page {page_number}: {e}")
+
+    chunk = ChunkRecord(
+        chunk_id=str(uuid.uuid4()),
+        doc_id=doc_id,
+        page_number=page_number,
+        section_title="",
+        chunk_index=chunk_index,
+        format_provenance={"original_format": original_format, "full_page": True},
+        chunk_type="multimodal",
+        chunk_text="",          # filled by vision.describe_full_page() in pipeline.py
+        gcs_image_path=gcs_image_path,
+        embedding=None,
+        embedding_model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
         embedding_task_type="RETRIEVAL_DOCUMENT",
     )
     return chunk, png_bytes

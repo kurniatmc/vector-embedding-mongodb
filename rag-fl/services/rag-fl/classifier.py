@@ -38,7 +38,8 @@ logger = logging.getLogger("ragfl.classifier")
 FORCE_MIXED_MODE = os.getenv("FORCE_MIXED_MODE", "false").lower() == "true"
 
 # ── Detection thresholds ──────────────────────────────────────────────────────
-_MIN_VISUAL_AREA_RATIO = 0.05    # visual cluster must cover > 5% of page area
+_MIN_VISUAL_AREA_RATIO = 0.03    # visual cluster must cover > 3% of page area
+_MIN_IMAGE_AREA_RATIO  = 0.005   # individual image XObject must exceed 0.5% of page area
 _MIN_DRAW_AREA_RATIO   = 0.005   # individual drawing must exceed 0.5% to join cluster
 _MIN_TEXT_CHARS        = 100     # page must have ≥ 100 non-table/visual chars → "has text"
 _MIN_BLOCK_CHARS       = 20      # individual text block must have ≥ 20 chars
@@ -75,8 +76,11 @@ _TABLE_SETTINGS_TEXT_LINES = {
 # Minimum non-empty cells to accept a pdfplumber table (Issue 5: phantom tables)
 _MIN_TABLE_CELLS = 4
 
-# Maximum average cell length to accept as structured table (not prose)
-_MAX_PROSE_CELL_LEN = 80
+# Maximum AVERAGE cell length to accept as structured table (not prose).
+# Uses average (not max/all) so that a single long description cell in an
+# otherwise short-celled table is not falsely rejected.
+# Prose paragraphs detected as tables have avg ~85+ chars; real data tables ~5-20 chars.
+_MAX_PROSE_CELL_LEN = 60
 
 
 # ── PageClassification dataclass (unchanged shape — detected_elements now list[dict]) ─
@@ -165,9 +169,10 @@ def classify_pdf_pages(file_bytes: bytes) -> list[PageClassification]:
                         continue
                     nonempty_cells = [str(c).strip() for row in data
                                       for c in row if c and str(c).strip()]
-                    if nonempty_cells and all(len(c) > _MAX_PROSE_CELL_LEN
-                                              for c in nonempty_cells):
-                        continue
+                    if nonempty_cells:
+                        avg_cell_len = sum(len(c) for c in nonempty_cells) / len(nonempty_cells)
+                        if avg_cell_len > _MAX_PROSE_CELL_LEN:
+                            continue
                     try:
                         tr = fitz.Rect(t.bbox)
                     except Exception:
@@ -192,8 +197,12 @@ def classify_pdf_pages(file_bytes: bytes) -> list[PageClassification]:
                 ws_tables = _detect_whitespace_tables(pl_page.extract_words(x_tolerance=3))
                 for ws_tbl in ws_tables:
                     ws_rect = fitz.Rect(ws_tbl["bbox"])
-                    # Skip if substantially overlaps an already-detected pdfplumber table
-                    if any(_overlap_ratio(ws_rect, tr) > 0.5 for tr in lines_table_rects):
+                    # Skip if substantially overlaps an already-detected pdfplumber table,
+                    # OR if it wraps around an existing table (bidirectional check).
+                    # A large false-positive table that contains real tables has a low
+                    # forward overlap ratio but a high reverse ratio (existing ⊂ candidate).
+                    if any(_overlap_ratio(ws_rect, tr) > 0.5 or _overlap_ratio(tr, ws_rect) > 0.5
+                           for tr in lines_table_rects):
                         continue
                     t_idx = len(tables_data)
                     tables_data.append({
@@ -209,18 +218,52 @@ def classify_pdf_pages(file_bytes: bytes) -> list[PageClassification]:
                 logger.debug(f"Page {page_num}: whitespace table detection: {e}")
 
             # ── Step 2: Image / chart detection ─────────────────────────────
-            raw_visual_rects: list[fitz.Rect] = []
 
-            # Raster images and Form XObjects (covers screenshot PDFs)
+            # Step 2A: Images — each XObject is a SEPARATE visual element (no clustering)
+            # Preserves individual image boundaries even for tightly-packed layouts
+            image_rects: list[fitz.Rect] = []
             for img_info in fitz_page.get_images(full=True):
                 try:
                     bbox = fitz_page.get_image_bbox(img_info)
-                    if bbox and not bbox.is_empty and bbox.get_area() > page_area * 0.03:
-                        raw_visual_rects.append(fitz.Rect(bbox))
+                    if bbox and not bbox.is_empty and bbox.get_area() > page_area * _MIN_IMAGE_AREA_RATIO:
+                        image_rects.append(fitz.Rect(bbox))
+                        logger.debug(f"Page {page_num}: Image XObject bbox={bbox}")
                 except Exception:
                     pass
 
-            # Vector drawings (chart axes, bars, pie slices, borders)
+            visual_elements: list[dict] = []
+            for img_rect in image_rects:
+                # Discard if almost entirely inside a reliable (lines-strategy) table
+                if any(_overlap_ratio(img_rect, tr) > _VISUAL_TABLE_THRESH
+                       for tr in lines_table_rects):
+                    continue
+                if img_rect.get_area() < page_area * _MIN_VISUAL_AREA_RATIO:
+                    continue
+                # Skip if the image bbox has substantial readable text underneath it.
+                # This handles PDFs where a decorative border/box is stored as an image
+                # XObject but the actual text content sits on a separate text layer.
+                # For such cases we want the text layer (Step 3) to handle the content,
+                # not Gemini Vision.  Genuine chart/photo XObjects have little or no
+                # underlying text (axis labels only, well below the threshold).
+                try:
+                    text_under = fitz_page.get_text("text", clip=img_rect).strip()
+                    if len(text_under) >= _MIN_TEXT_CHARS:
+                        logger.debug(
+                            f"Page {page_num}: Image XObject at {img_rect} skipped "
+                            f"(text layer has {len(text_under)} chars — treated as text region)"
+                        )
+                        continue
+                except Exception:
+                    pass
+                visual_elements.append({
+                    "type": "visual",
+                    "bbox": [img_rect.x0, img_rect.y0, img_rect.x1, img_rect.y1],
+                })
+
+            # Step 2B: Drawings — gap-cluster (same as before) to form chart regions,
+            # but skip clusters already covered by an image XObject.
+            # This preserves chart detection while avoiding double-detection with images.
+            drawing_rects: list[fitz.Rect] = []
             for d in fitz_page.get_drawings():
                 r = d.get("rect")
                 if not r:
@@ -228,29 +271,31 @@ def classify_pdf_pages(file_bytes: bytes) -> list[PageClassification]:
                 try:
                     fr = fitz.Rect(r)
                     if not fr.is_empty and fr.get_area() > page_area * _MIN_DRAW_AREA_RATIO:
-                        raw_visual_rects.append(fr)
+                        drawing_rects.append(fr)
                 except Exception:
                     pass
 
-            # Cluster nearby/overlapping visual rects into regions
-            visual_clusters = _cluster_rects(raw_visual_rects, gap=_CLUSTER_GAP)
-            visual_elements: list[dict] = []
-            for cluster in visual_clusters:
-                if cluster.get_area() < page_area * _MIN_VISUAL_AREA_RATIO:
-                    continue
-                # Discard clusters that are almost entirely RELIABLE table content.
-                # Only lines_table_rects (pdfplumber LINES strategy) are used here —
-                # soft/whitespace tables must not suppress genuine visual elements.
-                if any(_overlap_ratio(cluster, tr) > _VISUAL_TABLE_THRESH
-                       for tr in lines_table_rects):
-                    continue
-                # For large clusters (>25% page), try to split along whitespace bands
-                sub_rects = _try_split_cluster(fitz_page, cluster, page_area)
-                for sr in sub_rects:
+            if drawing_rects:
+                drawing_clusters = _cluster_rects(drawing_rects, gap=_CLUSTER_GAP)
+                for cluster in drawing_clusters:
+                    if cluster.get_area() < page_area * _MIN_VISUAL_AREA_RATIO:
+                        continue
+                    # Discard if almost entirely inside a reliable table
+                    if any(_overlap_ratio(cluster, tr) > _VISUAL_TABLE_THRESH
+                           for tr in lines_table_rects):
+                        continue
+                    # Skip if already substantially covered by a detected image XObject
+                    cluster_area = cluster.get_area()
+                    if cluster_area > 0 and any(
+                        (cluster & img_rect).get_area() / cluster_area > 0.7
+                        for img_rect in image_rects
+                    ):
+                        continue
                     visual_elements.append({
                         "type": "visual",
-                        "bbox": [sr.x0, sr.y0, sr.x1, sr.y1],
+                        "bbox": [cluster.x0, cluster.y0, cluster.x1, cluster.y1],
                     })
+
             visual_fitz_rects = [fitz.Rect(v["bbox"]) for v in visual_elements]
 
             # ── Step 1C: Horizontal-line-only tables (text+lines strategy) ───
@@ -263,9 +308,13 @@ def classify_pdf_pages(file_bytes: bytes) -> list[PageClassification]:
                         tr_new = fitz.Rect(t.bbox)
                     except Exception:
                         continue
-                    # Skip if substantially covered by already-detected table
+                    # Skip if substantially covered by already-detected table,
+                    # OR if it wraps around an existing table (bidirectional check).
+                    # A large false-positive table that contains real tables has a low
+                    # forward overlap ratio but a high reverse ratio (existing ⊂ candidate).
                     all_existing = lines_table_rects + soft_table_rects
-                    if any(_overlap_ratio(tr_new, ex) > 0.5 for ex in all_existing):
+                    if any(_overlap_ratio(tr_new, ex) > 0.5 or _overlap_ratio(ex, tr_new) > 0.5
+                           for ex in all_existing):
                         continue
                     # Skip if it substantially overlaps a detected visual element
                     if any(_overlap_ratio(tr_new, vr) > 0.4 for vr in visual_fitz_rects):
@@ -283,9 +332,10 @@ def classify_pdf_pages(file_bytes: bytes) -> list[PageClassification]:
                         continue
                     nonempty_cells = [str(c).strip() for row in data
                                       for c in row if c and str(c).strip()]
-                    if nonempty_cells and all(len(c) > _MAX_PROSE_CELL_LEN
-                                              for c in nonempty_cells):
-                        continue
+                    if nonempty_cells:
+                        avg_cell_len = sum(len(c) for c in nonempty_cells) / len(nonempty_cells)
+                        if avg_cell_len > _MAX_PROSE_CELL_LEN:
+                            continue
                     t_idx = len(tables_data)
                     tables_data.append({
                         "type": "table",
@@ -317,7 +367,7 @@ def classify_pdf_pages(file_bytes: bytes) -> list[PageClassification]:
                     non_white_ratio = non_white / total_px if total_px > 0 else 0
                     # Trigger: significant non-white content AND more than detected area suggests
                     # AND not a text-heavy page (text chars are detected separately)
-                    if (non_white_ratio > 0.15
+                    if (non_white_ratio > 0.20
                             and non_white_ratio > covered_area / max(page_area, 1) + 0.10
                             and text_ratio < 0.5):
                         visual_elements.append({
@@ -369,10 +419,16 @@ def classify_pdf_pages(file_bytes: bytes) -> list[PageClassification]:
             has_visual = bool(visual_elements)
 
             # ── Step 4: page_type from element presence ───────────────────────
+            # full_page_image: any page with visual + at least one other element type
+            # (table, text, or multiple visuals).  Per product directive: mixed-content
+            # pages are captured as a single high-res image and described by Gemini,
+            # rather than being parsed element-by-element.  Simple single-type pages
+            # (pure text, pure table, single standalone visual) keep element-based flow.
+            multi_visual = len(visual_elements) > 1
             if not (has_text or has_table or has_visual):
                 page_type, layer = "skip", "element_detect"
-            elif has_visual and (has_table or has_text):
-                page_type, layer = "mixed", "element_detect"
+            elif has_visual and (has_table or has_text or multi_visual):
+                page_type, layer = "full_page_image", "element_detect"
             elif has_visual:
                 page_type, layer = "multimodal", "element_detect"
             elif has_table and has_text:
@@ -382,10 +438,20 @@ def classify_pdf_pages(file_bytes: bytes) -> list[PageClassification]:
             else:
                 page_type, layer = "text", "element_detect"
 
-            # Assemble element list (tables first, then visuals, then text)
-            all_elements: list = tables_data + visual_elements + (
-                text_elements if has_text else []
-            )
+            # For full_page_image pages, collapse detected elements into a single
+            # full-page element.  Individual table/visual/text elements are still
+            # detected above (so image_ratio / has_tables are correct), but the
+            # pipeline only sees one element and renders the entire page.
+            if page_type == "full_page_image":
+                all_elements: list = [{
+                    "type": "full_page_image",
+                    "bbox": [rect.x0, rect.y0, rect.x1, rect.y1],
+                }]
+            else:
+                # Assemble element list (tables first, then visuals, then text)
+                all_elements = tables_data + visual_elements + (
+                    text_elements if has_text else []
+                )
             if not all_elements:
                 all_elements = [{"type": "none"}]
 
@@ -456,6 +522,54 @@ def _cluster_rects(rects: list, gap: int = 20) -> list:
     return clusters
 
 
+def _cluster_only_overlapping(rects: list, overlap_threshold: float = 0.5) -> list:
+    """
+    Cluster rectangles ONLY if they overlap significantly (share >overlap_threshold
+    of the smaller rect's area). Unlike _cluster_rects, this does NOT merge nearby
+    rects — only truly overlapping ones. Used for vector drawings so that distinct
+    chart regions are not merged into a single bounding box.
+    Returns list of merged fitz.Rect objects.
+    """
+    if not rects:
+        return []
+
+    clusters = [[fitz.Rect(r)] for r in rects]
+
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(clusters)):
+            if merged:
+                break
+            for j in range(i + 1, len(clusters)):
+                found = False
+                for r1 in clusters[i]:
+                    for r2 in clusters[j]:
+                        intersection = r1 & r2
+                        if not intersection.is_empty:
+                            min_area = min(r1.get_area(), r2.get_area())
+                            if min_area > 0 and intersection.get_area() / min_area > overlap_threshold:
+                                clusters[i].extend(clusters[j])
+                                clusters.pop(j)
+                                merged = True
+                                found = True
+                                break
+                    if found:
+                        break
+                if merged:
+                    break
+
+    result = []
+    for cluster in clusters:
+        if not cluster:
+            continue
+        bbox = cluster[0]
+        for r in cluster[1:]:
+            bbox = bbox | r
+        result.append(bbox)
+    return result
+
+
 def _overlap_ratio(r1: fitz.Rect, r2: fitz.Rect) -> float:
     """Fraction of r1's area that overlaps with r2. Returns 0.0 if r1 has no area."""
     r1_area = r1.get_area()
@@ -481,12 +595,13 @@ def _make_skip(page_num: int) -> PageClassification:
 
 def _processing_rec(page_type: str) -> str:
     return {
-        "text":            "embed_text_only",
-        "table":           "pdfplumber_table_extract",
-        "multimodal":      "gemini_vision",
-        "mixed":           "element_based",
-        "skip":            "skip",
-        "structured_text": "embed_text_only",
+        "text":             "embed_text_only",
+        "table":            "pdfplumber_table_extract",
+        "multimodal":       "gemini_vision",
+        "mixed":            "element_based",
+        "full_page_image":  "gemini_full_page",
+        "skip":             "skip",
+        "structured_text":  "embed_text_only",
     }.get(page_type, "embed_text_only")
 
 
