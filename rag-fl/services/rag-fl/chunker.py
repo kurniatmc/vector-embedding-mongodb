@@ -386,7 +386,7 @@ def chunk_full_page_image(
         section_title="",
         chunk_index=chunk_index,
         format_provenance={"original_format": original_format, "full_page": True},
-        chunk_type="multimodal",
+        chunk_type="full_page_image",
         chunk_text="",          # filled by vision.describe_full_page() in pipeline.py
         gcs_image_path=gcs_image_path,
         embedding=None,

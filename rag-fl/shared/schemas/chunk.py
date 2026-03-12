@@ -33,9 +33,12 @@ class ChunkRecord(BaseModel):
     # Image: {"original_format": "jpeg/png", "original_filename": str}
     # PPTX:  {"original_format": "pptx", "slide_number": int}
 
-    chunk_type: str               # "text" | "table" | "multimodal"
+    chunk_type: str               # "text" | "table" | "multimodal" | "full_page_image"
     chunk_text: str               # text OR Gemini Vision description
     gcs_image_path: Optional[str] = None  # GCS path for multimodal, None otherwise
+
+    # Processing method — "existing" (Gotenberg/openpyxl pipeline) or "markitdown"
+    processing_method: str = "existing"
 
     embedding: Optional[list[float]] = None  # 768 dims, text-embedding-004
     embedding_model: Optional[str] = None    # "models/text-embedding-004"

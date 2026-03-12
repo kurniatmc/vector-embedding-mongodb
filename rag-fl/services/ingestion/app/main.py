@@ -94,12 +94,15 @@ app.include_router(webhooks_router)
 PIPELINE_URL = os.getenv("PIPELINE_URL", "http://rag-fl:8004")
 
 async def trigger_pipeline_processing(doc_id: str) -> None:
-    """Call rag-fl /process. On failure, rollback the document from MongoDB."""
+    """
+    Call rag-fl /process with processing_method='both' to run PyMuPDF + MarkItDown.
+    On failure, rollback the document from MongoDB.
+    """
     try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        async with httpx.AsyncClient(timeout=600.0) as client:
             resp = await client.post(
                 f"{PIPELINE_URL}/process",
-                json={"doc_id": doc_id, "dry_run": False},
+                json={"doc_id": doc_id, "dry_run": False, "processing_method": "both"},
             )
             resp.raise_for_status()
             logger.info(f"Auto-process succeeded for doc_id={doc_id}")
@@ -192,9 +195,28 @@ async def ingest(
     doc_id = str(uuid.uuid4())
     gcs_path = f"{doc_id}/{filename}"
 
-    # 8. Upload original file bytes to GCS
+    # 8. Upload to GCS
+    # DOCX/PPTX: the pipeline expects PDF bytes (Gotenberg-converted).
+    #   - Primary path → normalized PDF bytes (for PyMuPDF/pdfplumber pipeline)
+    #   - Secondary path → original DOCX/PPTX bytes (for MarkItDown native extraction)
+    # All other formats: upload original bytes as-is.
+    gcs_original_path: Optional[str] = None
+    upload_content = file_bytes
+    upload_content_type = mime_type
+
+    if original_format in ("docx", "pptx"):
+        upload_content = normalized.file_bytes   # Gotenberg-converted PDF
+        upload_content_type = "application/pdf"
+        orig_path = f"{doc_id}/orig_{filename}"
+        try:
+            upload_bytes(file_bytes, orig_path, content_type=mime_type)
+            gcs_original_path = orig_path
+            logger.info(f"Stored original {original_format} at GCS:{orig_path} (for MarkItDown)")
+        except Exception as e:
+            logger.warning(f"Could not store original bytes for MarkItDown ({filename}): {e}")
+
     try:
-        gcs_uri = upload_bytes(file_bytes, gcs_path, content_type=mime_type)
+        gcs_uri = upload_bytes(upload_content, gcs_path, content_type=upload_content_type)
         logger.info(f"Uploaded {filename} to GCS: {gcs_uri}")
     except Exception as e:
         logger.error(f"GCS upload failed for {filename}: {e}")
@@ -218,6 +240,8 @@ async def ingest(
         # Deduplication
         "content_hash": content_hash,
         "is_duplicate_of": None,
+        # Secondary GCS path for original DOCX/PPTX bytes (MarkItDown native extraction)
+        "gcs_original_path": gcs_original_path,
         # Chronological metadata
         "report_series": chrono.get("report_series"),
         "report_period": chrono.get("report_period"),

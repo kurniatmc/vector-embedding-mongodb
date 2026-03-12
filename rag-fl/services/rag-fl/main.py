@@ -50,6 +50,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 logger = logging.getLogger("ragfl.main")
 
 from citation import router as citation_router
+from comparison import router as comparison_router
 from search import router as search_router
 
 app = FastAPI(
@@ -63,6 +64,9 @@ app.include_router(citation_router)
 
 # Phase 6 — Search & Retrieval API endpoints
 app.include_router(search_router)
+
+# Comparison — PyMuPDF vs MarkItDown endpoints
+app.include_router(comparison_router)
 
 # Allow Next.js UI (localhost:3001) to call this API from the browser
 # CORS_ORIGINS can be comma-separated list for production (e.g., "https://app.domain.com,https://admin.domain.com")
@@ -80,6 +84,8 @@ app.add_middleware(
 class ProcessRequest(BaseModel):
     doc_id: str
     classify_only: bool = False
+    # "pymupdf" | "markitdown" | "both" (default — runs both for comparison)
+    processing_method: str = "both"
 
 
 class ProcessResponse(BaseModel):
@@ -115,20 +121,57 @@ async def process_document(req: ProcessRequest, background_tasks: BackgroundTask
 
     # Run synchronously (POC — acceptable for demo)
     from pipeline import process_by_doc_id
-    try:
-        result = process_by_doc_id(req.doc_id, classify_only=req.classify_only, auto_confirm=True)
-        return ProcessResponse(
-            doc_id=req.doc_id,
-            filename=doc.get("filename", ""),
-            status="EMBEDDED" if not req.classify_only else "UPLOADED",
-            message=(
-                f"Pipeline complete: {result.get('total_chunks', 0)} chunks, "
-                f"{result.get('gemini_calls', 0)} Gemini calls"
-            ),
-        )
-    except Exception as e:
-        logger.error(f"Pipeline failed for {req.doc_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Pipeline failed: {e}")
+
+    method = req.processing_method or "both"
+    pymupdf_result: dict = {}
+    markitdown_result: dict = {}
+
+    # ── PyMuPDF pipeline (existing, always runs unless markitdown-only) ───────
+    if method in ("pymupdf", "both"):
+        try:
+            pymupdf_result = process_by_doc_id(
+                req.doc_id, classify_only=req.classify_only, auto_confirm=True
+            )
+        except Exception as e:
+            logger.error(f"PyMuPDF pipeline failed for {req.doc_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"PyMuPDF pipeline failed: {e}")
+
+    # ── MarkItDown pipeline (parallel comparison, non-fatal if it fails) ──────
+    if method in ("markitdown", "both") and not req.classify_only:
+        try:
+            from markitdown_pipeline import run_markitdown_by_doc_id, should_process_with_markitdown
+            _doc_meta = get_documents_col().find_one(
+                {"doc_id": req.doc_id}, {"filename": 1, "original_format": 1}
+            ) or {}
+            if should_process_with_markitdown(
+                _doc_meta.get("filename", ""),
+                _doc_meta.get("original_format", ""),
+            ):
+                markitdown_result = run_markitdown_by_doc_id(req.doc_id)
+                logger.info(
+                    f"MarkItDown pipeline complete for {req.doc_id}: "
+                    f"{markitdown_result.get('total_chunks', 0)} chunks"
+                )
+            else:
+                logger.info(f"MarkItDown skipped for {req.doc_id} (guard: format/baseline)")
+        except Exception as e:
+            logger.warning(f"MarkItDown pipeline failed for {req.doc_id} (non-fatal): {e}")
+            markitdown_result = {"total_chunks": 0, "error": str(e)}
+
+    total_pymupdf = pymupdf_result.get("total_chunks", 0)
+    total_mkd = markitdown_result.get("total_chunks", 0)
+    msg = (
+        f"PyMuPDF: {total_pymupdf} chunks"
+        + (f" | MarkItDown: {total_mkd} chunks" if method in ("markitdown", "both") else "")
+        + (f" | {pymupdf_result.get('gemini_calls', 0)} Gemini calls" if pymupdf_result else "")
+    )
+
+    return ProcessResponse(
+        doc_id=req.doc_id,
+        filename=doc.get("filename", ""),
+        status="EMBEDDED" if not req.classify_only else "UPLOADED",
+        message=msg,
+    )
 
 
 # ── Document listing ──────────────────────────────────────────────────────────
@@ -282,8 +325,19 @@ async def _run_seeding(comparison_files: list[str]) -> None:
                 logger.info(f"Seed skip (already embedded): {path.name}")
                 continue
             logger.info(f"Seed start: {path.name}")
-            doc_id, *_ = await asyncio.to_thread(ingest_file_direct, path)
+            doc_id, file_bytes, filename, original_format, format_provenance = \
+                await asyncio.to_thread(ingest_file_direct, path)
             await asyncio.to_thread(process_by_doc_id, doc_id, False, True)
+            # Also run MarkItDown pipeline for comparison (only for Office files)
+            try:
+                from markitdown_pipeline import run_markitdown_pipeline, should_process_with_markitdown
+                if should_process_with_markitdown(filename, original_format):
+                    await asyncio.to_thread(
+                        run_markitdown_pipeline,
+                        file_bytes, filename, doc_id, original_format, format_provenance,
+                    )
+            except Exception as e:
+                logger.warning(f"Seed MarkItDown failed for {path.name}: {e}")
             logger.info(f"Seed complete: {path.name}")
         except Exception as e:
             logger.error(f"Seed failed for {path.name}: {e}")

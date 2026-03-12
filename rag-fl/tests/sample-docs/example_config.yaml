@@ -1,0 +1,297 @@
+# ============================================================
+# Contoh File Konfigurasi YAML - Aplikasi Web Lengkap
+# ============================================================
+
+app:
+  name: "MyApp Platform"
+  version: "2.5.1"
+  environment: "production"
+  debug: false
+  timezone: "Asia/Jakarta"
+  locale: "id_ID"
+  secret_key: "superSecretKey1234!@#$"
+  allowed_hosts:
+    - "myapp.com"
+    - "www.myapp.com"
+    - "api.myapp.com"
+
+# ============================================================
+# Konfigurasi Server
+# ============================================================
+server:
+  host: "0.0.0.0"
+  port: 8080
+  workers: 4
+  timeout: 30
+  keepalive: 5
+  max_requests: 1000
+  max_requests_jitter: 50
+  ssl:
+    enabled: true
+    cert_file: "/etc/ssl/certs/myapp.crt"
+    key_file: "/etc/ssl/private/myapp.key"
+    protocols:
+      - "TLSv1.2"
+      - "TLSv1.3"
+
+# ============================================================
+# Konfigurasi Database
+# ============================================================
+database:
+  default:
+    engine: "postgresql"
+    host: "db.myapp.com"
+    port: 5432
+    name: "myapp_db"
+    user: "db_user"
+    password: "db_password_secret"
+    pool_size: 10
+    max_overflow: 20
+    pool_timeout: 30
+    pool_recycle: 1800
+    options:
+      connect_timeout: 10
+      application_name: "MyApp"
+
+  replica:
+    engine: "postgresql"
+    host: "db-replica.myapp.com"
+    port: 5432
+    name: "myapp_db"
+    user: "db_readonly"
+    password: "readonly_password"
+    pool_size: 5
+
+# ============================================================
+# Konfigurasi Cache (Redis)
+# ============================================================
+cache:
+  backend: "redis"
+  host: "redis.myapp.com"
+  port: 6379
+  db: 0
+  password: "redis_secret"
+  timeout: 300
+  key_prefix: "myapp:"
+  max_connections: 50
+  socket_timeout: 5
+  retry_on_timeout: true
+
+# ============================================================
+# Konfigurasi MongoDB
+# ============================================================
+mongodb:
+  uri: "mongodb://mongo_user:mongo_pass@mongo.myapp.com:27017"
+  database: "myapp_mongo"
+  max_pool_size: 20
+  min_pool_size: 5
+  server_selection_timeout: 5000
+  connect_timeout: 10000
+  collections:
+    documents: "raw_documents"
+    embeddings: "doc_embeddings"
+    sessions: "user_sessions"
+    logs: "audit_logs"
+
+# ============================================================
+# Konfigurasi AI / LLM
+# ============================================================
+ai:
+  provider: "google"
+  model: "gemini-1.5-pro"
+  embedding_model: "text-embedding-004"
+  embedding_dimensions: 768
+  temperature: 0.7
+  max_tokens: 4096
+  top_p: 0.9
+  top_k: 40
+  timeout: 60
+  retry_attempts: 3
+  retry_delay: 2
+  vision:
+    enabled: true
+    max_image_size_mb: 10
+    supported_formats:
+      - "jpg"
+      - "jpeg"
+      - "png"
+      - "webp"
+      - "gif"
+
+# ============================================================
+# Konfigurasi RAG Pipeline
+# ============================================================
+rag:
+  chunk_size: 512
+  chunk_overlap: 64
+  max_chunks_per_doc: 500
+  similarity_threshold: 0.75
+  top_k_results: 10
+  supported_file_types:
+    - "pdf"
+    - "docx"
+    - "pptx"
+    - "xlsx"
+    - "yaml"
+    - "txt"
+    - "png"
+    - "jpg"
+  processing:
+    ocr_enabled: true
+    extract_tables: true
+    extract_images: true
+    language_detection: true
+
+# ============================================================
+# Konfigurasi Email (SMTP)
+# ============================================================
+email:
+  backend: "smtp"
+  host: "smtp.gmail.com"
+  port: 587
+  use_tls: true
+  username: "noreply@myapp.com"
+  password: "email_app_password"
+  default_from: "MyApp <noreply@myapp.com>"
+  timeout: 10
+  templates:
+    welcome: "emails/welcome.html"
+    reset_password: "emails/reset_password.html"
+    invoice: "emails/invoice.html"
+
+# ============================================================
+# Konfigurasi Storage (File Upload)
+# ============================================================
+storage:
+  backend: "s3"
+  bucket: "myapp-uploads"
+  region: "ap-southeast-1"
+  access_key: "AWS_ACCESS_KEY"
+  secret_key: "AWS_SECRET_KEY"
+  cdn_url: "https://cdn.myapp.com"
+  max_upload_size_mb: 100
+  allowed_extensions:
+    - "pdf"
+    - "docx"
+    - "xlsx"
+    - "pptx"
+    - "png"
+    - "jpg"
+    - "jpeg"
+  local_fallback:
+    enabled: false
+    path: "/var/app/uploads"
+
+# ============================================================
+# Konfigurasi Logging
+# ============================================================
+logging:
+  level: "INFO"
+  format: "json"
+  output:
+    - type: "console"
+      enabled: true
+    - type: "file"
+      enabled: true
+      path: "/var/log/myapp/app.log"
+      max_size_mb: 100
+      backup_count: 10
+    - type: "sentry"
+      enabled: true
+      dsn: "https://sentry_dsn_key@sentry.io/project_id"
+      level: "ERROR"
+
+# ============================================================
+# Konfigurasi Keamanan (Security)
+# ============================================================
+security:
+  cors:
+    enabled: true
+    origins:
+      - "https://myapp.com"
+      - "https://www.myapp.com"
+    methods:
+      - "GET"
+      - "POST"
+      - "PUT"
+      - "DELETE"
+      - "OPTIONS"
+    allow_headers:
+      - "Content-Type"
+      - "Authorization"
+      - "X-Request-ID"
+  rate_limiting:
+    enabled: true
+    requests_per_minute: 60
+    burst: 20
+  jwt:
+    algorithm: "HS256"
+    access_token_expire_minutes: 30
+    refresh_token_expire_days: 7
+  password:
+    min_length: 8
+    require_uppercase: true
+    require_number: true
+    require_special_char: true
+
+# ============================================================
+# Konfigurasi Monitoring & Health Check
+# ============================================================
+monitoring:
+  health_check:
+    enabled: true
+    endpoint: "/health"
+    checks:
+      - database
+      - redis
+      - mongodb
+      - storage
+  metrics:
+    enabled: true
+    endpoint: "/metrics"
+    provider: "prometheus"
+  tracing:
+    enabled: true
+    provider: "opentelemetry"
+    endpoint: "http://otel-collector:4317"
+    sample_rate: 0.1
+
+# ============================================================
+# Konfigurasi Fitur (Feature Flags)
+# ============================================================
+features:
+  dark_mode: true
+  ai_chat: true
+  document_ocr: true
+  multi_language: false
+  beta_dashboard: false
+  export_to_pdf: true
+  real_time_notifications: true
+  two_factor_auth: true
+
+# ============================================================
+# Konfigurasi Docker / Deployment
+# ============================================================
+deployment:
+  replicas: 3
+  strategy: "rolling"
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2000m"
+      memory: "2Gi"
+  autoscaling:
+    enabled: true
+    min_replicas: 2
+    max_replicas: 10
+    target_cpu_utilization: 70
+  liveness_probe:
+    http_get_path: "/health"
+    initial_delay_seconds: 30
+    period_seconds: 10
+  readiness_probe:
+    http_get_path: "/health"
+    initial_delay_seconds: 15
+    period_seconds: 5

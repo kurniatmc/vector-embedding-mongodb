@@ -8,7 +8,8 @@
       "Bash(test -f requirements.txt)",
       "Bash(ls -la services/*/requirements.txt services/*/.env* .env* Makefile)",
       "Bash(wc -l services/rag-fl/*.py services/ingestion/app/*.py services/ui/app/*.tsx shared/**/*.py)",
-      "Bash(docker compose:*)"
+      "Bash(docker compose:*)",
+      "Bash(curl -s http://localhost:8004/comparison/documents | python -m json.tool 2>&1 | head -60)"
     ]
   }
 }
