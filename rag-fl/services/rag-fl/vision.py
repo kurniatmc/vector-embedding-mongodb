@@ -18,18 +18,97 @@ _DESCRIPTION_PROMPT = (
 )
 
 _FULL_PAGE_PROMPT = (
-    "You are analyzing a full document page that contains mixed content. "
-    "Describe this page comprehensively, including:\n"
-    "- All text content (headings, paragraphs, labels)\n"
-    "- All tables: reproduce the full structure with column headers and every data row\n"
-    "- All charts/graphs: type, axis labels, data values and trends\n"
-    "- All diagrams/flowcharts: components and relationships\n"
-    "- Spatial layout: what appears at the top, middle, and bottom of the page\n"
-    "- Key insights or patterns visible across elements\n\n"
-    "Format your response as a cohesive description that captures the page's "
-    "complete information so that it can be retrieved and used as context for "
-    "answering questions about its content."
+    "You are analyzing a full document page that may contain mixed content types. "
+    "Provide a comprehensive, structured description in the following format:\n\n"
+
+    "**Overall Description:**\n"
+    "Describe what the page shows at a high level (e.g., 'This page presents passenger "
+    "demographics data with a comparison table and visualization').\n\n"
+
+    "**Spatial Layout:**\n"
+    "- Top: [describe what appears at the top of the page]\n"
+    "- Middle: [describe what appears in the middle]\n"
+    "- Bottom: [describe what appears at the bottom]\n\n"
+
+    "**Text Content:**\n"
+    "IMPORTANT: Extract all visible text EXACTLY as written. Do not paraphrase, summarize, "
+    "or add interpretation. Include:\n"
+    "- Headings/Titles: [list all headings and titles verbatim]\n"
+    "- Paragraphs: [reproduce any paragraph text word-for-word]\n"
+    "- Labels/Annotations: [list all labels, captions, and annotations]\n"
+    "- Column Labels: [if table present, list all column headers]\n"
+    "- Row Labels: [if table present, list all row headers]\n"
+    "- Chart Title: [if chart present, exact title]\n"
+    "- Chart Axis Labels: [if chart present, x-axis and y-axis labels]\n"
+    "- Chart Legend: [if chart present, legend items]\n"
+    "- Any other text: [buttons, links, notes, footnotes]\n\n"
+
+    "**Table Structure and Data:**\n"
+    "If the page contains ANY table (native table, table as image, screenshot of table, "
+    "or table embedded in infographic), reproduce it EXACTLY in Markdown table format:\n\n"
+    "| Column1 | Column2 | Column3 | Column4 |\n"
+    "|---------|---------|---------|----------|\n"
+    "| value1  | value2  | value3  | value4   |\n"
+    "| value5  | value6  | value7  | value8   |\n\n"
+    "Include ALL rows and columns with their EXACT values. Do not summarize or skip rows.\n\n"
+
+    "**Charts and Graphs:**\n"
+    "If the page contains charts, graphs, or plots, describe:\n"
+    "- Type: [bar chart, line graph, pie chart, scatter plot, histogram, heatmap, etc.]\n"
+    "- Data series: [list all data series shown]\n"
+    "- Key values: [notable data points, ranges, or values]\n"
+    "- Trends/Patterns: [describe visible trends, comparisons, or insights]\n\n"
+
+    "**Diagrams, Flowcharts, and Schemas:**\n"
+    "If the page contains diagrams, flowcharts, process flows, network diagrams, "
+    "organizational charts, system architectures, or schemas, describe:\n"
+    "- Type: [flowchart, process diagram, network diagram, org chart, architecture diagram, etc.]\n"
+    "- Components: [list all boxes, nodes, or elements with their labels]\n"
+    "- Relationships: [describe arrows, connections, or flows between components]\n"
+    "- Process flow: [if sequential, describe the order/steps]\n\n"
+
+    "**Infographics and Visual Elements:**\n"
+    "If the page contains infographics, icons, illustrations, photos, or other visual elements:\n"
+    "- Describe the visual content and its purpose\n"
+    "- Extract any embedded text or numbers from the visual\n"
+    "- Explain what information the visual is conveying\n\n"
+
+    "**Key Insights and Patterns:**\n"
+    "Summarize the main insights, patterns, or conclusions that can be drawn from "
+    "combining all elements on the page.\n\n"
+
+    "CRITICAL INSTRUCTIONS:\n"
+    "1. Extract text VERBATIM - do not paraphrase or add words\n"
+    "2. For tables: reproduce COMPLETE structure with ALL rows and columns in Markdown format\n"
+    "3. For multiple content types on one page: describe ALL of them separately\n"
+    "4. Maintain original formatting, capitalization, and punctuation in extracted text\n"
+    "5. If unsure about a value, transcribe what you see without guessing"
 )
+
+_EXCEL_CHART_PROMPT = (
+    "You are analyzing an Excel sheet rendered as PDF. "
+    "IMPORTANT: This sheet's TABLE DATA has already been extracted separately via MarkItDown. "
+    "Your ONLY task is to extract VISUAL ELEMENTS (charts, graphs, diagrams).\n\n"
+
+    "DO NOT extract or describe table cells, data rows, or text content.\n"
+    "ONLY describe charts, graphs, and visual elements.\n\n"
+
+    "For each chart/graph found, provide:\n"
+    "**Chart Type:** [bar chart, line graph, pie chart, scatter plot, combo chart, etc.]\n"
+    "**Chart Title:** [exact title if visible]\n"
+    "**Axis Labels:**\n"
+    "  - X-axis: [label and units]\n"
+    "  - Y-axis: [label and units]\n"
+    "**Data Series:** [list all series names from legend]\n"
+    "**Key Values:** [notable data points, ranges, or peak values]\n"
+    "**Trends and Insights:** [describe visible patterns, comparisons, or conclusions]\n\n"
+
+    "If no charts/graphs are visible on this sheet, respond with: 'No charts found.'\n\n"
+
+    "CRITICAL: Ignore all table data, cell values, and text content. "
+    "Focus exclusively on visual chart elements."
+)
+
 _MODEL = os.getenv("VISION_MODEL", "gemini-2.0-flash")
 
 # Circuit breaker state
@@ -126,3 +205,42 @@ def reset_circuit() -> None:
     global _failure_count, _circuit_open
     _failure_count = 0
     _circuit_open = False
+
+
+def describe_excel_chart(image_bytes: bytes) -> Optional[str]:
+    """
+    Call Gemini with chart-only prompt for Excel sheets.
+    Used when Excel has charts that need visual extraction (MarkItDown handles tables).
+    Shares the same circuit breaker as other vision functions.
+    """
+    global _failure_count, _circuit_open
+
+    if _circuit_open:
+        logger.warning("Vision circuit breaker OPEN — skipping Excel chart call")
+        return None
+
+    try:
+        client = _get_client()
+        response = client.models.generate_content(
+            model=_MODEL,
+            contents=[
+                _EXCEL_CHART_PROMPT,
+                types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+            ],
+        )
+        description = response.text.strip()
+        _failure_count = 0
+
+        # Return None if no charts found (avoid creating empty chunks)
+        if "No charts found" in description:
+            return None
+
+        return description
+
+    except Exception as e:
+        _failure_count += 1
+        logger.error(f"Gemini Excel chart call failed ({_failure_count}/{_FAILURE_LIMIT}): {e}")
+        if _failure_count >= _FAILURE_LIMIT:
+            _circuit_open = True
+            logger.error(f"Vision circuit breaker OPENED after {_FAILURE_LIMIT} failures.")
+        return None

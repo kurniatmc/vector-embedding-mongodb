@@ -467,12 +467,13 @@ def run_pipeline(
             "chunk_count": 1, "preview": yaml_text[:80],
         })
 
-    elif original_format in ("jpeg", "jpg", "png"):
+    elif original_format in ("jpeg", "jpg", "png", "bmp", "tiff", "gif", "webp"):
         chunk, img_bytes = render_and_upload_image_file(
             file_bytes, doc_id, original_format, filename
         )
         if chunk:
-            desc = describe_page_image(img_bytes)
+            # Use comprehensive full_page prompt for table extraction from images
+            desc = describe_full_page(img_bytes)
             if desc:
                 chunk.chunk_text = desc
                 gemini_calls_made += 1
@@ -598,6 +599,7 @@ def ingest_file_direct(file_path: Path) -> tuple[str, bytes, str, str, dict]:
         "pdf": "pdf", "xlsx": "xlsx", "xls": "xls",
         "yaml": "yaml", "yml": "yaml",
         "jpeg": "jpeg", "jpg": "jpeg", "png": "png",
+        "bmp": "bmp", "tiff": "tiff", "tif": "tiff", "gif": "gif", "webp": "webp",
         "pptx": "pptx", "docx": "docx",
     }
     original_format = format_map.get(ext, ext)
@@ -620,7 +622,11 @@ def ingest_file_direct(file_path: Path) -> tuple[str, bytes, str, str, dict]:
         format_provenance = {"original_format": "xlsx", "sheets": sheets}
 
     # Chrono metadata
-    mime_map = {"pdf": "application/pdf", "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+    mime_map = {
+        "pdf": "application/pdf",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "bmp": "image/bmp", "tiff": "image/tiff", "gif": "image/gif", "webp": "image/webp",
+    }
     mime_type = mime_map.get(original_format, f"application/{original_format}")
     chrono = extract_report_period(filename, file_bytes, mime_type)
 

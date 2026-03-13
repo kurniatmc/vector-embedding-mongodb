@@ -9,7 +9,8 @@
       "Bash(ls -la services/*/requirements.txt services/*/.env* .env* Makefile)",
       "Bash(wc -l services/rag-fl/*.py services/ingestion/app/*.py services/ui/app/*.tsx shared/**/*.py)",
       "Bash(docker compose:*)",
-      "Bash(curl -s http://localhost:8004/comparison/documents | python -m json.tool 2>&1 | head -60)"
+      "Bash(curl -s http://localhost:8004/comparison/documents | python -m json.tool 2>&1 | head -60)",
+      "Bash(curl -s -X POST \"http://localhost:8004/process\" -H \"Content-Type: application/json\" -d '{\"\"doc_id\"\": \"\"99369ba9-8d4a-43b7-9c28-c0a6066c7ac3\"\", \"\"processing_method\"\": \"\"pymupdf\"\"}')"
     ]
   }
 }

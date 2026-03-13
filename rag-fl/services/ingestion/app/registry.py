@@ -25,6 +25,10 @@ REGISTRY: dict[str, type[BaseProcessor]] = {
     "text/plain":           YAMLProcessor,  # fallback for .yaml files misdetected as text/plain
     "image/jpeg":           ImageProcessor,
     "image/png":            ImageProcessor,
+    "image/bmp":            ImageProcessor,
+    "image/tiff":           ImageProcessor,
+    "image/gif":            ImageProcessor,
+    "image/webp":           ImageProcessor,
 }
 
 # Extension fallback for when MIME detection is ambiguous
@@ -39,6 +43,11 @@ EXTENSION_FALLBACK: dict[str, str] = {
     ".jpg":   "image/jpeg",
     ".jpeg":  "image/jpeg",
     ".png":   "image/png",
+    ".bmp":   "image/bmp",
+    ".tiff":  "image/tiff",
+    ".tif":   "image/tiff",
+    ".gif":   "image/gif",
+    ".webp":  "image/webp",
 }
 
 

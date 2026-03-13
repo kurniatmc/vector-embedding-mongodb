@@ -74,8 +74,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="rag-fl Ingestion Service",
-    version="2.1.0",
-    description="Format-agnostic file intake. Handles PDF, Excel, PPTX, DOCX, YAML, JPEG, PNG.",
+    version="2.2.0",
+    description="Format-agnostic file intake. Handles PDF, Excel, PPTX, DOCX, YAML, JPEG, PNG, BMP, TIFF, GIF, WEBP.",
     lifespan=lifespan,
 )
 # CORS_ORIGINS can be comma-separated list for production
@@ -93,16 +93,20 @@ app.include_router(webhooks_router)
 
 PIPELINE_URL = os.getenv("PIPELINE_URL", "http://rag-fl:8004")
 
-async def trigger_pipeline_processing(doc_id: str) -> None:
+async def trigger_pipeline_processing(doc_id: str, original_format: str) -> None:
     """
-    Call rag-fl /process with processing_method='both' to run PyMuPDF + MarkItDown.
+    Call rag-fl /process with format-specific method:
+    - XLSX/XLS/CSV: 'both' (PyMuPDF for page_profiles + MarkItDown for tables + Vision for charts)
+    - DOCX/PPTX/PDF/Images: 'pymupdf' (Gotenberg → PyMuPDF → Vision)
     On failure, rollback the document from MongoDB.
     """
+    processing_method = "both" if original_format in ("xlsx", "xls", "csv") else "pymupdf"
+
     try:
         async with httpx.AsyncClient(timeout=600.0) as client:
             resp = await client.post(
                 f"{PIPELINE_URL}/process",
-                json={"doc_id": doc_id, "dry_run": False, "processing_method": "both"},
+                json={"doc_id": doc_id, "dry_run": False, "processing_method": processing_method},
             )
             resp.raise_for_status()
             logger.info(f"Auto-process succeeded for doc_id={doc_id}")
@@ -269,8 +273,8 @@ async def ingest(
         raise HTTPException(status_code=500, detail=f"MongoDB insert failed: {e}")
 
     # Auto-trigger pipeline processing in background
-    background_tasks.add_task(trigger_pipeline_processing, doc_id)
-    logger.info(f"Queued auto-process for doc_id={doc_id}")
+    background_tasks.add_task(trigger_pipeline_processing, doc_id, original_format)
+    logger.info(f"Queued auto-process for doc_id={doc_id} (format={original_format})")
 
     return IngestResponse(
         doc_id=doc_id,

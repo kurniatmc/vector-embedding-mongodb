@@ -1,11 +1,17 @@
 """
-services/rag-fl/comparison.py
-Comparison API — PyMuPDF vs MarkItDown embedding quality.
+services/rag-fl/comparison.py (chunks viewer)
+Document Chunks Viewer API — Browse extracted chunks per document.
 
 Endpoints:
-  GET  /comparison/documents      → list EMBEDDED docs + chunk counts per method
-  GET  /comparison/{doc_id}       → side-by-side chunks for one document
-  POST /comparison/search         → same query against both method chunk sets
+  GET  /comparison/documents      → list all EMBEDDED documents
+  GET  /comparison/{doc_id}       → view all chunks for one document
+  POST /comparison/search         → search across chunks
+
+Processing methods (informational only, no comparison):
+  - XLSX/CSV: MarkItDown (tables) + Vision (charts)
+  - DOCX/PPTX: Gotenberg → PDF → Vision
+  - PDF: PyMuPDF + Vision
+  - Images: Vision (image analysis)
 """
 import logging
 import os
@@ -19,67 +25,10 @@ from shared.utils.mongo_client import (
     doc_embeddings as get_embeddings_col,
     documents as get_documents_col,
 )
-from shared.utils.vector_search import vector_search
 
 logger = logging.getLogger("ragfl.comparison")
 
 router = APIRouter(prefix="/comparison", tags=["comparison"])
-
-# ── Business rules (mirrors markitdown_pipeline.py) ──────────────────────────
-
-_BASELINE_FILENAMES: set[str] = {
-    "CustomerChurn_Jan2025.xlsx",
-    "PureTable_CustomerChurn_Jan2025.pdf",
-    "SS_CustomerChurn_Jan2025.pdf",
-}
-
-_NO_COMPARISON_FORMATS: set[str] = {"pdf", "jpeg", "jpg", "png", "gif", "bmp", "tiff"}
-
-
-def get_method_a_label(original_format: str) -> str:
-    """Short label for Method A (existing pipeline)."""
-    return {
-        "xlsx": "openpyxl",
-        "xls":  "openpyxl",
-        "docx": "Gotenberg → PDF",
-        "pptx": "Gotenberg → PDF",
-        "csv":  "pandas/csv",
-        "yaml": "PyYAML",
-        "yml":  "PyYAML",
-    }.get(original_format, "Current Pipeline")
-
-
-def get_method_b_label(original_format: str) -> str:
-    """Short label for Method B (MarkItDown) that describes what it's reading."""
-    return {
-        "xlsx": "Direct Excel Read",
-        "xls":  "Direct Excel Read",
-        "docx": "Direct DOCX Read",
-        "pptx": "Direct PPTX Read",
-        "csv":  "Direct CSV Read",
-        "yaml": "Direct YAML Read",
-        "yml":  "Direct YAML Read",
-    }.get(original_format, "MarkItDown")
-
-
-def _add_embedding_dims(chunks: list[dict]) -> list[dict]:
-    """Pop embedding vector, replace with dims count."""
-    for c in chunks:
-        emb = c.pop("embedding", None)
-        c["embedding_dims"] = len(emb) if emb else 0
-    return chunks
-
-# ── MongoDB filter helpers ─────────────────────────────────────────────────────
-# "existing" = current pipeline (Gotenberg → PDF → PyMuPDF for DOCX/PPTX, openpyxl for Excel).
-# Legacy chunks stored with "pymupdf" before the rename are also included for backward compat.
-_PYMUPDF_FILTER: dict = {
-    "$or": [
-        {"processing_method": "existing"},
-        {"processing_method": "pymupdf"},   # legacy value pre-rename
-        {"processing_method": {"$exists": False}},
-        {"processing_method": None},
-    ]
-}
 
 _CHUNK_PROJ = {
     "_id": 0,
@@ -98,25 +47,62 @@ _CHUNK_PROJ = {
 }
 
 
-# ── Request models ─────────────────────────────────────────────────────────────
-
 class ComparisonSearchRequest(BaseModel):
     query: str
     doc_id: Optional[str] = None
     top_k: int = 5
 
 
+def _get_processing_info(original_format: str) -> str:
+    """Return processing method description for UI display."""
+    if original_format in ("xlsx", "xls", "csv"):
+        return "MarkItDown + Vision (charts)"
+    elif original_format in ("docx", "pptx"):
+        return "Gotenberg → PDF → Vision"
+    elif original_format == "pdf":
+        return "PyMuPDF + Vision"
+    elif original_format in ("jpeg", "jpg", "png", "bmp", "tiff", "gif", "webp"):
+        return "Vision (image analysis)"
+    elif original_format in ("yaml", "yml"):
+        return "YAML parser"
+    else:
+        return "Standard pipeline"
+
+
+def _add_embedding_dims(chunks: list[dict]) -> list[dict]:
+    """Pop embedding vector, replace with dims count."""
+    for c in chunks:
+        emb = c.pop("embedding", None)
+        c["embedding_dims"] = len(emb) if emb else 0
+    return chunks
+
+
+def _type_breakdown(chunks: list[dict]) -> dict:
+    breakdown: dict = {}
+    for c in chunks:
+        t = c.get("chunk_type", "unknown")
+        breakdown[t] = breakdown.get(t, 0) + 1
+    return breakdown
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/documents")
 async def list_comparison_documents():
-    """List all EMBEDDED documents with chunk counts for each method."""
+    """List all EMBEDDED documents with total chunk counts."""
     docs = list(
         get_documents_col()
         .find(
             {"status": "EMBEDDED"},
-            {"_id": 0, "doc_id": 1, "filename": 1, "original_format": 1,
-             "total_pages": 1, "report_period": 1},
+            {
+                "_id": 0,
+                "doc_id": 1,
+                "filename": 1,
+                "original_format": 1,
+                "total_pages": 1,
+                "report_period": 1,
+                "created_at": 1,
+            },
         )
         .sort("created_at", -1)
     )
@@ -125,26 +111,12 @@ async def list_comparison_documents():
     result = []
     for doc in docs:
         did = doc["doc_id"]
-        fmt = doc.get("original_format", "")
-        fname = doc.get("filename", "")
-
-        # Baseline and no-comparison formats never show method comparison
-        is_baseline = fname in _BASELINE_FILENAMES
-        is_blocked = fmt in _NO_COMPARISON_FORMATS
-
-        pymupdf_n = col.count_documents({"doc_id": did, **_PYMUPDF_FILTER})
-        mkd_n = col.count_documents({"doc_id": did, "processing_method": "markitdown"})
+        total_chunks = col.count_documents({"doc_id": did})
 
         result.append({
             **doc,
-            "pymupdf_chunks": pymupdf_n,
-            "markitdown_chunks": mkd_n,
-            # both_ready = False for baseline files and PDF/image formats
-            "both_ready": (not is_baseline) and (not is_blocked) and pymupdf_n > 0 and mkd_n > 0,
-            "method_a_label": get_method_a_label(fmt),
-            "method_b_label": get_method_b_label(fmt),
-            "is_baseline": is_baseline,
-            "comparison_supported": (not is_baseline) and (not is_blocked),
+            "total_chunks": total_chunks,
+            "processing_info": _get_processing_info(doc.get("original_format", "")),
         })
 
     return {"documents": result, "count": len(result)}
@@ -152,7 +124,7 @@ async def list_comparison_documents():
 
 @router.get("/{doc_id}")
 async def get_comparison(doc_id: str, limit: int = Query(50)):
-    """Return both method chunk sets for one document."""
+    """Return all chunks for one document."""
     doc = get_documents_col().find_one({"doc_id": doc_id}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -160,92 +132,61 @@ async def get_comparison(doc_id: str, limit: int = Query(50)):
     fname = doc.get("filename", "")
     fmt = doc.get("original_format", "")
 
-    if fname in _BASELINE_FILENAMES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"'{fname}' is a baseline file — use format comparison, not method comparison.",
-        )
-    if fmt in _NO_COMPARISON_FORMATS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{fmt.upper()} files use {get_method_a_label(fmt)} only — no MarkItDown comparison.",
-        )
-
     col = get_embeddings_col()
 
-    pymupdf_chunks = list(
-        col.find({"doc_id": doc_id, **_PYMUPDF_FILTER}, _CHUNK_PROJ)
-        .sort([("page_number", 1), ("chunk_index", 1)])
-        .limit(limit)
-    )
-    mkd_chunks = list(
-        col.find({"doc_id": doc_id, "processing_method": "markitdown"}, _CHUNK_PROJ)
+    chunks = list(
+        col.find({"doc_id": doc_id}, _CHUNK_PROJ)
         .sort([("page_number", 1), ("chunk_index", 1)])
         .limit(limit)
     )
 
-    pymupdf_total = col.count_documents({"doc_id": doc_id, **_PYMUPDF_FILTER})
-    mkd_total = col.count_documents({"doc_id": doc_id, "processing_method": "markitdown"})
-
-    pymupdf_chunks = _add_embedding_dims(pymupdf_chunks)
-    mkd_chunks = _add_embedding_dims(mkd_chunks)
+    total_chunks = col.count_documents({"doc_id": doc_id})
+    chunks = _add_embedding_dims(chunks)
 
     return {
         "doc_id": doc_id,
         "filename": fname,
         "original_format": fmt,
-        "method_a_label": get_method_a_label(fmt),
-        "method_b_label": get_method_b_label(fmt),
-        "pymupdf": {
-            "total_chunks": pymupdf_total,
-            "chunks_shown": len(pymupdf_chunks),
-            "type_breakdown": _type_breakdown(pymupdf_chunks),
-            "chunks": pymupdf_chunks,
-        },
-        "markitdown": {
-            "total_chunks": mkd_total,
-            "chunks_shown": len(mkd_chunks),
-            "type_breakdown": _type_breakdown(mkd_chunks),
-            "chunks": mkd_chunks,
-        },
+        "processing_info": _get_processing_info(fmt),
+        "total_chunks": total_chunks,
+        "chunks_shown": len(chunks),
+        "type_breakdown": _type_breakdown(chunks),
+        "chunks": chunks,
     }
 
 
 @router.post("/search")
 async def comparison_search(req: ComparisonSearchRequest):
-    """Run the same query against PyMuPDF and MarkItDown chunk sets."""
+    """Search across all chunks (unified, no method separation)."""
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     query_vec = _embed_query(req.query)
     col = get_embeddings_col()
 
-    base: dict = {}
+    base_filter: dict = {}
     if req.doc_id:
-        base["doc_id"] = req.doc_id
+        base_filter["doc_id"] = req.doc_id
 
-    pymupdf_results = _search_method(col, {**base, **_PYMUPDF_FILTER}, query_vec, req.top_k)
-    mkd_results = _search_method(
-        col, {**base, "processing_method": "markitdown"}, query_vec, req.top_k
-    )
+    results = _search_method(col, base_filter, query_vec, req.top_k)
 
     # Attach filenames when not scoped to one doc
     if not req.doc_id:
-        doc_ids = {r["doc_id"] for r in pymupdf_results + mkd_results}
+        doc_ids = {r["doc_id"] for r in results}
         docs_map = {
             d["doc_id"]: d["filename"]
             for d in get_documents_col().find(
                 {"doc_id": {"$in": list(doc_ids)}}, {"doc_id": 1, "filename": 1}
             )
         }
-        for r in pymupdf_results + mkd_results:
+        for r in results:
             r["filename"] = docs_map.get(r["doc_id"], "")
 
     return {
         "query": req.query,
         "doc_id": req.doc_id,
-        "pymupdf_results": pymupdf_results,
-        "markitdown_results": mkd_results,
+        "results": results,
+        "count": len(results),
     }
 
 
@@ -291,11 +232,3 @@ def _search_method(col, query_filter: dict, query_vec: list[float], top_k: int) 
             scored.append({**c, "score": round(score, 4)})
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:top_k]
-
-
-def _type_breakdown(chunks: list[dict]) -> dict:
-    breakdown: dict = {}
-    for c in chunks:
-        t = c.get("chunk_type", "unknown")
-        breakdown[t] = breakdown.get(t, 0) + 1
-    return breakdown

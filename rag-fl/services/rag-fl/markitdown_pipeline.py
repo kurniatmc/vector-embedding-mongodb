@@ -34,6 +34,7 @@ from shared.utils.mongo_client import (  # noqa: E402
 )
 from embedder import embed_texts  # noqa: E402
 from markitdown_extractor import extract_with_markitdown  # noqa: E402
+from vision import describe_excel_chart  # noqa: E402
 
 logger = logging.getLogger("ragfl.markitdown_pipeline")
 
@@ -129,6 +130,13 @@ def run_markitdown_pipeline(
         )
         all_chunks.append(chunk)
 
+    # For Excel: also extract charts via Vision
+    if original_format in ("xlsx", "xls"):
+        chart_chunks = extract_excel_charts(file_bytes, doc_id, filename)
+        if chart_chunks:
+            all_chunks.extend(chart_chunks)
+            logger.info(f"Added {len(chart_chunks)} chart chunks to MarkItDown pipeline")
+
     if not all_chunks:
         return {"doc_id": doc_id, "filename": filename, "total_chunks": 0, "method": "markitdown"}
 
@@ -158,6 +166,105 @@ def run_markitdown_pipeline(
         "total_chunks": stored,
         "method": "markitdown",
     }
+
+
+def extract_excel_charts(file_bytes: bytes, doc_id: str, filename: str) -> list[ChunkRecord]:
+    """
+    Detect and extract charts from Excel sheets using Gemini Vision.
+    Returns list of chart chunks (chunk_type='multimodal').
+    """
+    import io
+    import openpyxl
+    import httpx
+    import fitz  # PyMuPDF for rendering PDF pages
+
+    chart_chunks: list[ChunkRecord] = []
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    except Exception as e:
+        logger.warning(f"Could not load Excel for chart detection ({filename}): {e}")
+        return chart_chunks
+
+    # Check each sheet for charts
+    sheets_with_charts: list[tuple[int, str]] = []  # (sheet_index, sheet_name)
+    for idx, sheet in enumerate(wb.worksheets):
+        if sheet._charts:  # Sheet has embedded charts
+            sheets_with_charts.append((idx, sheet.title))
+            logger.info(f"Sheet '{sheet.title}' has {len(sheet._charts)} chart(s)")
+
+    wb.close()
+
+    if not sheets_with_charts:
+        logger.info(f"No charts detected in {filename}")
+        return chart_chunks
+
+    # Convert Excel to PDF via Gotenberg for rendering
+    gotenberg_url = os.getenv("GOTENBERG_URL", "http://libreoffice:3000")
+    try:
+        resp = httpx.post(
+            f"{gotenberg_url}/forms/libreoffice/convert",
+            files={"file": (filename, file_bytes)},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        pdf_bytes = resp.content
+    except Exception as e:
+        logger.error(f"Gotenberg conversion failed for chart extraction ({filename}): {e}")
+        return chart_chunks
+
+    # Render sheets with charts as images and call Vision
+    try:
+        pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for sheet_idx, sheet_name in sheets_with_charts:
+            if sheet_idx >= pdf_doc.page_count:
+                logger.warning(f"Sheet index {sheet_idx} out of PDF range ({pdf_doc.page_count} pages)")
+                continue
+
+            page = pdf_doc[sheet_idx]
+            # Render at 4x zoom for high quality without any cropping
+            # This ensures complete chart visibility regardless of position on sheet
+            pix = page.get_pixmap(matrix=fitz.Matrix(4, 4))
+
+            # Use raw PNG bytes directly - no cropping to avoid cutting off chart content
+            img_bytes = pix.tobytes("png")
+
+            # Call Gemini Vision with chart-only prompt
+            chart_desc = describe_excel_chart(img_bytes)
+            if not chart_desc:
+                logger.info(f"No charts extracted from sheet '{sheet_name}' (Vision returned None)")
+                continue
+
+            # Upload image to GCS
+            from shared.utils.gcs_client import upload_bytes
+            # Use .v1 format to match UI image proxy expectations (/image/{doc_id}/{page}?v=1)
+            gcs_key = f"{doc_id}.{sheet_idx + 1}.v1"
+            upload_bytes(img_bytes, gcs_key, content_type="image/png")
+
+            # Create chart chunk
+            chunk = ChunkRecord(
+                doc_id=doc_id,
+                page_number=sheet_idx + 1,
+                section_title=f"{sheet_name} (Chart)",
+                chunk_index=len(chart_chunks),
+                chunk_type="multimodal",
+                chunk_text=chart_desc,
+                gcs_image_path=gcs_key,
+                processing_method="markitdown",  # Part of MarkItDown pipeline (chart extraction)
+                format_provenance={
+                    "original_format": "xlsx",
+                    "sheet_name": sheet_name,
+                    "extraction": "vision_chart",
+                },
+            )
+            chart_chunks.append(chunk)
+            logger.info(f"Chart extracted from sheet '{sheet_name}': {len(chart_desc)} chars")
+
+        pdf_doc.close()
+    except Exception as e:
+        logger.error(f"Chart rendering/extraction failed ({filename}): {e}")
+
+    return chart_chunks
 
 
 def run_markitdown_by_doc_id(doc_id: str) -> dict:

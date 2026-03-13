@@ -489,7 +489,14 @@ def render_and_upload_image_file(
     """For standalone JPEG/PNG files. Upload to GCS, return chunk with empty chunk_text."""
     gcs_bucket = os.getenv("GCS_BUCKET", "rag-fl-documents")
     gcs_path = f"{doc_id}.1"
-    content_type = "image/jpeg" if original_format in ("jpeg", "jpg") else "image/png"
+    content_type = {
+        "jpeg": "image/jpeg", "jpg": "image/jpeg",
+        "png": "image/png",
+        "bmp": "image/bmp",
+        "tiff": "image/tiff",
+        "gif": "image/gif",
+        "webp": "image/webp",
+    }.get(original_format, "image/jpeg")
 
     gcs_image_path = None
     try:

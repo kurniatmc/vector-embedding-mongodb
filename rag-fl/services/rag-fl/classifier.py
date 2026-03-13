@@ -858,7 +858,7 @@ def classify_non_pdf(
                 processing_recommendation="embed_text_only",
                 estimated_text_tokens=0, layer_used="non_pdf",
             ))
-        elif original_format in ("jpeg", "jpg", "png"):
+        elif original_format in ("jpeg", "jpg", "png", "bmp", "tiff", "gif", "webp"):
             logger.info(f"Page {page_num:3d} | multimodal    | Image file")
             results.append(PageClassification(
                 page_number=page_num, page_type="multimodal",

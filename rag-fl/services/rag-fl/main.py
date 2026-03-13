@@ -152,11 +152,34 @@ async def process_document(req: ProcessRequest, background_tasks: BackgroundTask
                     f"MarkItDown pipeline complete for {req.doc_id}: "
                     f"{markitdown_result.get('total_chunks', 0)} chunks"
                 )
+                # Update document status to EMBEDDED (only if markitdown-only, not "both")
+                if method == "markitdown":
+                    get_documents_col().update_one(
+                        {"doc_id": req.doc_id},
+                        {"$set": {"status": "EMBEDDED", "updated_at": datetime.utcnow()}}
+                    )
             else:
                 logger.info(f"MarkItDown skipped for {req.doc_id} (guard: format/baseline)")
         except Exception as e:
             logger.warning(f"MarkItDown pipeline failed for {req.doc_id} (non-fatal): {e}")
             markitdown_result = {"total_chunks": 0, "error": str(e)}
+
+    # For Excel: delete PyMuPDF TEXT/TABLE chunks (avoid duplication), keep VISUAL chunks (charts)
+    if method == "both" and not req.classify_only:
+        _doc_meta = get_documents_col().find_one(
+            {"doc_id": req.doc_id}, {"original_format": 1}
+        ) or {}
+        if _doc_meta.get("original_format") in ("xlsx", "xls", "csv"):
+            deleted = get_embeddings_col().delete_many({
+                "doc_id": req.doc_id,
+                "processing_method": {"$ne": "markitdown"},
+                "chunk_type": {"$in": ["text", "table"]}  # Delete text/table, keep multimodal/visual
+            })
+            if deleted.deleted_count > 0:
+                logger.info(
+                    f"Deleted {deleted.deleted_count} PyMuPDF text/table chunks for Excel "
+                    f"(MarkItDown primary for tables, Vision kept for charts)"
+                )
 
     total_pymupdf = pymupdf_result.get("total_chunks", 0)
     total_mkd = markitdown_result.get("total_chunks", 0)
