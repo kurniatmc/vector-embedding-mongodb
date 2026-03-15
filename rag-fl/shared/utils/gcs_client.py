@@ -20,6 +20,28 @@ def get_gcs_client() -> storage.Client:
     return storage.Client()
 
 
+def _is_fake_gcs() -> bool:
+    """Check if we're using fake-gcs-server (local dev mode)."""
+    endpoint = os.getenv("GCS_ENDPOINT", "https://storage.googleapis.com")
+    return "fake-gcs" in endpoint or "4443" in endpoint
+
+
+def _ensure_bucket(client, bucket_name: str):
+    """
+    Create bucket if it doesn't exist.
+    ONLY for fake-gcs-server dev mode — real GCS buckets must be pre-created.
+    """
+    # Skip bucket creation for real GCS (assumes bucket already exists)
+    if not _is_fake_gcs():
+        return
+    
+    try:
+        client.get_bucket(bucket_name)
+    except Exception:
+        # Bucket doesn't exist in fake-gcs, create it
+        client.create_bucket(bucket_name)
+
+
 def upload_bytes(
     file_bytes: bytes,
     gcs_path: str,
@@ -28,6 +50,7 @@ def upload_bytes(
     """Upload bytes to GCS. Returns the full gs:// URI."""
     bucket_name = os.getenv("GCS_BUCKET", "rag-fl-documents")
     client = get_gcs_client()
+    _ensure_bucket(client, bucket_name)
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(gcs_path)
     blob.upload_from_string(file_bytes, content_type=content_type)

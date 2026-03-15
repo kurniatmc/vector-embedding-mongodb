@@ -10,6 +10,8 @@ Core endpoints (this file):
   GET  /document/{doc_id}/status               → processing status
   GET  /document/{doc_id}/pages                → per-page profiles
   GET  /document/{doc_id}/chunks/{page_number} → chunks for one page
+  GET  /document/{doc_id}/explorer             → page explorer (GCS-based, stateless)
+  GET  /document/{doc_id}/page/{page}/details  → single page details with images
   GET  /image/{doc_id}/{page_number}           → GCS image proxy (Phase 4)
   GET  /config                                 → runtime config
 
@@ -292,20 +294,224 @@ async def document_page_chunks(doc_id: str, page_number: int):
 
 @app.get("/image/{doc_id}/{page_number}")
 async def get_page_image(doc_id: str, page_number: int, v: int = Query(0)):
-    """Proxy a page PNG from fake-gcs to the browser. Avoids CORS issues.
-    v=0 (default) → first visual: {doc_id}.{page_number}
-    v>0            → additional visual crops: {doc_id}.{page_number}.v{v}
     """
-    from shared.utils.gcs_client import download_bytes, blob_exists
+    Proxy a page PNG from GCS to the browser. Avoids CORS issues.
+    
+    New GCS path format: {doc_id}/page_{page_number}/{chunk_id}
+    v=0 (default) → first visual on the page
+    v>0           → additional visual crops on the same page
+    
+    Looks up the chunk in MongoDB to get the correct gcs_image_path.
+    """
+    from shared.utils.gcs_client import download_bytes
 
-    gcs_path = f"{doc_id}.{page_number}" if v == 0 else f"{doc_id}.{page_number}.v{v}"
-    if not blob_exists(gcs_path):
-        raise HTTPException(status_code=404, detail=f"Image not found: {gcs_path}")
+    # Find image chunks for this doc_id + page_number
+    # Include both "multimodal" and "full_page_image" chunk types
+    # Sort by chunk_index to maintain visual order (v=0, v=1, v=2, ...)
+    chunks = list(
+        get_embeddings_col()
+        .find(
+            {
+                "doc_id": doc_id,
+                "page_number": page_number,
+                "chunk_type": {"$in": ["multimodal", "full_page_image"]},
+                "gcs_image_path": {"$exists": True, "$ne": None},
+            },
+            {"gcs_image_path": 1, "chunk_index": 1},
+        )
+        .sort("chunk_index", 1)
+        .skip(v)
+        .limit(1)
+    )
+
+    if not chunks:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Image not found: doc_id={doc_id}, page={page_number}, visual_index={v}"
+        )
+
+    gcs_image_path = chunks[0].get("gcs_image_path")
+    if not gcs_image_path:
+        raise HTTPException(status_code=404, detail=f"No GCS path for image: doc_id={doc_id}, page={page_number}, v={v}")
+
+    # Extract gcs_path from gs://bucket/path format
+    try:
+        gcs_path = gcs_image_path.replace("gs://", "").split("/", 1)[1]
+    except (IndexError, AttributeError):
+        raise HTTPException(status_code=500, detail=f"Invalid GCS path format: {gcs_image_path}")
+
     try:
         image_bytes = download_bytes(gcs_path)
         return Response(content=image_bytes, media_type="image/png")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch image: {e}")
+
+
+# ── Page Explorer (GCS-based, stateless) ─────────────────────────────────────
+
+@app.get("/document/{doc_id}/explorer")
+async def document_page_explorer(doc_id: str):
+    """
+    Page Explorer - Returns complete page-level view from MongoDB/GCS.
+    
+    This endpoint is stateless - all data comes from MongoDB and GCS.
+    No local Docker storage is used, so data persists across restarts.
+    
+    Returns for each page:
+    - page_number, page_type, detected_elements
+    - visual_count: number of images available
+    - images: list of {chunk_id, gcs_image_path, chunk_index} for UI navigation
+    """
+    # 1. Verify document exists
+    doc = get_documents_col().find_one(
+        {"doc_id": doc_id},
+        {"_id": 0, "filename": 1, "total_pages": 1, "status": 1, "original_format": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+    
+    # 2. Get all page profiles
+    profiles = list(
+        get_profiles_col()
+        .find({"doc_id": doc_id}, {"_id": 0})
+        .sort("page_number", 1)
+    )
+    
+    # 3. Get all image chunks (multimodal + full_page_image) grouped by page
+    image_chunks = list(
+        get_embeddings_col()
+        .find(
+            {
+                "doc_id": doc_id,
+                "chunk_type": {"$in": ["multimodal", "full_page_image"]},
+                "gcs_image_path": {"$exists": True, "$ne": None},
+            },
+            {
+                "_id": 0, "chunk_id": 1, "page_number": 1, 
+                "gcs_image_path": 1, "chunk_index": 1,
+                "format_provenance": 1, "section_title": 1,
+            }
+        )
+        .sort("chunk_index", 1)
+    )
+    
+    # Group images by page_number
+    images_by_page = {}
+    for img in image_chunks:
+        pnum = img.get("page_number", 1)
+        if pnum not in images_by_page:
+            images_by_page[pnum] = []
+        images_by_page[pnum].append({
+            "chunk_id": img.get("chunk_id"),
+            "gcs_image_path": img.get("gcs_image_path"),
+            "chunk_index": img.get("chunk_index"),
+            "is_full_page": img.get("format_provenance", {}).get("full_page", False),
+            "visual_index": img.get("format_provenance", {}).get("visual_index", 0),
+        })
+    
+    # 4. Build page explorer data
+    pages = []
+    for profile in profiles:
+        pnum = profile["page_number"]
+        page_images = images_by_page.get(pnum, [])
+        
+        pages.append({
+            "page_number": pnum,
+            "page_type": profile.get("page_type", "unknown"),
+            "processing_recommendation": profile.get("processing_recommendation", ""),
+            "has_tables": profile.get("has_tables", False),
+            "text_ratio": profile.get("text_ratio", 0),
+            "image_ratio": profile.get("image_ratio", 0),
+            "estimated_text_tokens": profile.get("estimated_text_tokens", 0),
+            "visual_count": len(page_images),
+            "images": page_images,
+            "detected_elements": profile.get("detected_elements", []),
+        })
+    
+    # 5. Summary stats
+    total_images = sum(len(imgs) for imgs in images_by_page.values())
+    pages_with_images = len(images_by_page)
+    
+    return {
+        "doc_id": doc_id,
+        "filename": doc.get("filename", ""),
+        "status": doc.get("status", ""),
+        "original_format": doc.get("original_format", ""),
+        "total_pages": doc.get("total_pages", len(profiles)),
+        "pages": pages,
+        "summary": {
+            "total_pages": len(profiles),
+            "pages_with_images": pages_with_images,
+            "total_images": total_images,
+        }
+    }
+
+
+@app.get("/document/{doc_id}/page/{page_number}/details")
+async def page_details(doc_id: str, page_number: int):
+    """
+    Get detailed view of a single page including all chunks and images.
+    Completely stateless - fetches from MongoDB/GCS on each request.
+    """
+    # Verify document
+    doc = get_documents_col().find_one(
+        {"doc_id": doc_id},
+        {"_id": 0, "filename": 1, "original_format": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+    
+    # Get page profile
+    profile = get_profiles_col().find_one(
+        {"doc_id": doc_id, "page_number": page_number},
+        {"_id": 0}
+    )
+    
+    # Get all chunks for this page (all types)
+    all_chunks = list(
+        get_embeddings_col()
+        .find(
+            {"doc_id": doc_id, "page_number": page_number},
+            {
+                "_id": 0, "chunk_id": 1, "chunk_type": 1, "chunk_text": 1,
+                "chunk_index": 1, "section_title": 1, "gcs_image_path": 1,
+                "format_provenance": 1, "embedding_model": 1,
+            }
+        )
+        .sort("chunk_index", 1)
+    )
+    
+    # Separate chunks by type
+    text_chunks = [c for c in all_chunks if c.get("chunk_type") == "text"]
+    table_chunks = [c for c in all_chunks if c.get("chunk_type") == "table"]
+    image_chunks = [c for c in all_chunks if c.get("chunk_type") in ["multimodal", "full_page_image"]]
+    
+    # Build image URLs for the UI (using our /image proxy endpoint)
+    images = []
+    for i, chunk in enumerate(image_chunks):
+        if chunk.get("gcs_image_path"):
+            images.append({
+                "chunk_id": chunk.get("chunk_id"),
+                "chunk_index": chunk.get("chunk_index"),
+                "proxy_url": f"/image/{doc_id}/{page_number}?v={i}",
+                "gcs_image_path": chunk.get("gcs_image_path"),
+                "is_full_page": chunk.get("format_provenance", {}).get("full_page", False),
+                "visual_index": chunk.get("format_provenance", {}).get("visual_index", 0),
+            })
+    
+    return {
+        "doc_id": doc_id,
+        "filename": doc.get("filename", ""),
+        "page_number": page_number,
+        "page_profile": profile,
+        "chunks": {
+            "text": text_chunks,
+            "tables": table_chunks,
+            "multimodal": multimodal_chunks,
+        },
+        "images": images,
+        "total_chunks": len(all_chunks),
+    }
 
 
 # ── Config endpoint (Phase 4 top bar — FORCE_MIXED_MODE indicator) ────────────
@@ -323,9 +529,9 @@ async def get_config():
 # ── Startup seeding (Problem 3) ───────────────────────────────────────────────
 
 _DEFAULT_SEED_FILES = [
-    "tests/sample-docs/CustomerChurn_Jan2025.xlsx",
-    "tests/sample-docs/PureTable_CustomerChurn_Jan2025.pdf",
-    "tests/sample-docs/SS_CustomerChurn_Jan2025.pdf",
+    # "tests/sample-docs/CustomerChurn_Jan2025.xlsx",
+    # "tests/sample-docs/PureTable_CustomerChurn_Jan2025.pdf",
+    # "tests/sample-docs/SS_CustomerChurn_Jan2025.pdf",
 ]
 
 

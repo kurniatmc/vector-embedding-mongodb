@@ -1,0 +1,24 @@
+{
+  "name": "embedding_index",
+  "type": "vectorSearch",
+  "database": "ragfl",
+  "collectionName": "doc_embeddings",
+  "definition": {
+    "fields": [
+      {
+        "type": "vector",
+        "path": "embedding",
+        "numDimensions": 768,
+        "similarity": "cosine"
+      },
+      {
+        "type": "filter",
+        "path": "doc_id"
+      },
+      {
+        "type": "filter",
+        "path": "chunk_type"
+      }
+    ]
+  }
+}

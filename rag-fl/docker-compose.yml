@@ -1,50 +1,5 @@
 services:
 
-  # ── MongoDB 7 — single-node replica set rs0 ──────────────────────────────
-  mongo:
-    image: mongo:7.0
-    container_name: ragfl-mongo
-    command:
-      - mongod
-      - --replSet
-      - rs0
-      - --bind_ip_all
-      - --wiredTigerCacheSizeGB
-      - "1"          # hard cap inside container (2 GB container limit)
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongo_data:/data/db
-    networks:
-      - ragfl
-    # Healthy = this node is the PRIMARY (replica set fully ready)
-    healthcheck:
-      test: >
-        mongosh --quiet --eval
-        "try { quit(db.isMaster().ismaster ? 0 : 1) } catch(e) { quit(1) }"
-      interval: 10s
-      timeout: 10s
-      retries: 30
-      start_period: 60s
-    deploy:
-      resources:
-        limits:
-          memory: 2g
-
-  # ── Replica-set + collection init (runs once, then exits) ─────────────────
-  mongo-init:
-    image: mongo:7.0
-    container_name: ragfl-mongo-init
-    depends_on:
-      mongo:
-        condition: service_started   # only needs mongod to be up, not primary yet
-    volumes:
-      - ./infra/mongo-init:/scripts:ro
-    networks:
-      - ragfl
-    restart: "no"
-    entrypoint: ["bash", "/scripts/init.sh"]
-
   # ── Redis 7 — append-only persistence, 512 MB cap ────────────────────────
   redis:
     image: redis:7-alpine
@@ -70,17 +25,19 @@ services:
         limits:
           memory: 512m
 
-  # ── fake-gcs-server — identical REST/JSON API to Google Cloud Storage ─────
+  # ── Fake GCS Server — LOCAL DEVELOPMENT ONLY ─────────────────────────────
+  # To use: docker compose --profile fake-gcs up -d
+  # To switch to real GCS: unset GCS_ENDPOINT or set to https://storage.googleapis.com
   fake-gcs:
     image: fsouza/fake-gcs-server:latest
     container_name: ragfl-fake-gcs
+    profiles: ["fake-gcs"]
     ports:
       - "4443:4443"
     volumes:
       - gcs_data:/data
     networks:
       - ragfl
-    # HTTP scheme matches GCS_ENDPOINT=http://fake-gcs:4443 in .env
     command:
       - -scheme
       - http
@@ -113,11 +70,11 @@ services:
     volumes:
       - "${INPUT_DIR}:/input"
       - "${OUTPUT_DIR}:/output"
+      # Mount GCS credentials for real GCS access (only used when GCS_ENDPOINT is real)
+      - "./creds:/app/creds:ro"
     networks:
       - ragfl
     depends_on:
-      mongo:
-        condition: service_healthy
       redis:
         condition: service_healthy
     env_file: .env
@@ -128,9 +85,12 @@ services:
       - GCS_BUCKET=${GCS_BUCKET}
       - REDIS_URL=${REDIS_URL}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      # For real GCS: uses service account key mounted from ./creds/
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/creds/service-account-key.json
       - ENVIRONMENT=${ENVIRONMENT}
       - DRY_RUN_THRESHOLD=${DRY_RUN_THRESHOLD}
       - LIBREOFFICE_URL=${LIBREOFFICE_URL}
+      - VECTOR_SEARCH_BACKEND=${VECTOR_SEARCH_BACKEND}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 10s
@@ -149,15 +109,13 @@ services:
       - "${RAG_FL_PORT:-8004}:8004"
     volumes:
       - "${OUTPUT_DIR}:/output"
+      # Mount GCS credentials for real GCS access (only used when GCS_ENDPOINT is real)
+      - "./creds:/app/creds:ro"
     networks:
       - ragfl
     depends_on:
-      mongo:
-        condition: service_healthy
       redis:
         condition: service_healthy
-      fake-gcs:
-        condition: service_started
     env_file: .env
     environment:
       - MONGODB_URI=${MONGODB_URI}
@@ -166,13 +124,16 @@ services:
       - GCS_BUCKET=${GCS_BUCKET}
       - REDIS_URL=${REDIS_URL}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      # For real GCS: uses service account key mounted from ./creds/
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/creds/service-account-key.json
       - EMBEDDING_MODEL=${EMBEDDING_MODEL}
       - VISION_MODEL=${VISION_MODEL}
       - ENVIRONMENT=${ENVIRONMENT}
       - DRY_RUN_THRESHOLD=${DRY_RUN_THRESHOLD}
       - FORCE_MIXED_MODE=${FORCE_MIXED_MODE}
       - OUTPUT_DIR=/output
-      - SEED_FILES=${SEED_FILES:-tests/sample-docs/CustomerChurn_Jan2025.xlsx,tests/sample-docs/PureTable_CustomerChurn_Jan2025.pdf,tests/sample-docs/SS_CustomerChurn_Jan2025.pdf}
+      # - SEED_FILES=${SEED_FILES:-tests/sample-docs/CustomerChurn_Jan2025.xlsx,tests/sample-docs/PureTable_CustomerChurn_Jan2025.pdf,tests/sample-docs/SS_CustomerChurn_Jan2025.pdf}
+      - VECTOR_SEARCH_BACKEND=${VECTOR_SEARCH_BACKEND}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
       interval: 10s
@@ -200,28 +161,10 @@ services:
       - NEXT_PUBLIC_FORCE_MIXED_MODE=${FORCE_MIXED_MODE:-false}
     restart: unless-stopped
 
-  # ── Mongo Express — browser-based MongoDB admin UI ────────────────────────
-  mongo-express:
-    image: mongo-express:1.0.2
-    container_name: ragfl-mongo-express
-    ports:
-      - "8081:8081"
-    networks:
-      - ragfl
-    depends_on:
-      mongo:
-        condition: service_healthy
-    environment:
-      - ME_CONFIG_MONGODB_SERVER=mongo
-      - ME_CONFIG_MONGODB_PORT=27017
-      - ME_CONFIG_BASICAUTH=false
-    restart: unless-stopped
-
 networks:
   ragfl:
     driver: bridge
 
 volumes:
-  mongo_data:
   redis_data:
   gcs_data:

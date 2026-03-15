@@ -50,6 +50,8 @@ interface SearchResult {
   section_title?: string;
   score: number;
   gcs_image_path?: string;
+  doc_id: string;
+  filename: string;
 }
 
 // ── Image URL helper (Phase 3B — parses .v{n} suffix from gcs_image_path) ────
@@ -617,6 +619,7 @@ export default function Page() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
+  const [searchInSelectedOnly, setSearchInSelectedOnly] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState("");
   const [forceMixedMode, setForceMixedMode] = useState("—");
@@ -760,20 +763,25 @@ export default function Page() {
 
   async function handleSearch(e: React.FormEvent) {
     e.preventDefault();
-    if (!selectedDoc || !searchQuery.trim()) return;
+    if (!searchQuery.trim()) return;
     setSearching(true);
     setSearchResults([]);
     try {
+      // Use global search across all documents, or filter to selected if specified
       const res = await fetch(
-        `${RAG_FL}/search/within/${selectedDoc.doc_id}`,
+        `${RAG_FL}/search`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query: searchQuery, top_k: 5 }),
+          body: JSON.stringify({ 
+            query: searchQuery, 
+            top_k: 10,
+            filters: (searchInSelectedOnly && selectedDoc) ? { doc_ids: [selectedDoc.doc_id] } : undefined
+          }),
         }
       );
       const data = await res.json();
-      setSearchResults(data.results || []);
+      setSearchResults(data.answer_chunks || []);
     } catch {
       /* search failed */
     } finally {
@@ -781,10 +789,20 @@ export default function Page() {
     }
   }
 
-  function scrollToPage(pageNum: number) {
-    if (expandedPage !== pageNum) handlePageClick(pageNum);
+  async function handleResultClick(result: SearchResult) {
+    // If result is from a different document, switch to it
+    if (!selectedDoc || selectedDoc.doc_id !== result.doc_id) {
+      const doc = docs.find((d) => d.doc_id === result.doc_id);
+      if (doc) {
+        await handleSelectDoc(doc);
+      }
+    }
+    // Scroll to the page
+    if (expandedPage !== result.page_number) {
+      handlePageClick(result.page_number);
+    }
     setTimeout(() => {
-      pageRefs.current[pageNum]?.scrollIntoView({
+      pageRefs.current[result.page_number]?.scrollIntoView({
         behavior: "smooth",
         block: "center",
       });
@@ -1055,17 +1073,26 @@ export default function Page() {
                 rows={2}
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder={
-                  selectedDoc
-                    ? "Ask anything about this document…"
-                    : "Select a document first"
+                placeholder={searchInSelectedOnly && selectedDoc 
+                  ? `Search in ${selectedDoc.filename}…`
+                  : "Search across all documents…"
                 }
-                disabled={!selectedDoc}
-                className="w-full bg-slate-900 border border-slate-600 rounded px-2.5 py-1.5 text-sm text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 resize-none disabled:opacity-40 transition-colors"
+                className="w-full bg-slate-900 border border-slate-600 rounded px-2.5 py-1.5 text-sm text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 resize-none transition-colors"
               />
+              {selectedDoc && (
+                <label className="flex items-center gap-2 text-xs text-slate-400 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={searchInSelectedOnly}
+                    onChange={(e) => setSearchInSelectedOnly(e.target.checked)}
+                    className="rounded border-slate-600 bg-slate-800 text-indigo-500 focus:ring-indigo-500"
+                  />
+                  <span>Search only in selected document</span>
+                </label>
+              )}
               <button
                 type="submit"
-                disabled={!selectedDoc || searching || !searchQuery.trim()}
+                disabled={searching || !searchQuery.trim()}
                 className="w-full py-1.5 text-sm bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 rounded text-white font-medium transition-colors"
               >
                 {searching ? "Searching…" : "Search"}
@@ -1077,16 +1104,14 @@ export default function Page() {
           <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
             {searchResults.length === 0 && !searching && (
               <p className="text-xs text-slate-600 text-center mt-8">
-                {selectedDoc
-                  ? "Results appear here"
-                  : "Select a document to search"}
+                Search results appear here
               </p>
             )}
 
             {searchResults.map((r) => (
               <button
                 key={r.chunk_id}
-                onClick={() => scrollToPage(r.page_number)}
+                onClick={() => handleResultClick(r)}
                 className="w-full text-left bg-slate-900/60 rounded border border-slate-700 hover:border-indigo-500 transition-colors p-2.5 space-y-2"
               >
                 {/* Score bar */}
@@ -1119,9 +1144,9 @@ export default function Page() {
                   {r.chunk_text}
                 </p>
 
-                {/* Citation */}
+                {/* Citation - show document name */}
                 <p className="text-xs text-indigo-400/70">
-                  {selectedDoc?.filename} · Page {r.page_number}
+                  {r.filename} · Page {r.page_number}
                   {r.section_title ? ` · ${r.section_title}` : ""}
                 </p>
               </button>

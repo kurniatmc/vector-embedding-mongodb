@@ -1,13 +1,17 @@
 """
 shared/utils/vector_search.py
 
-Single entry-point for vector search.  Auto-switches based on ENVIRONMENT:
-  - development  → local cosine similarity (MongoDB Community, no $vectorSearch)
-  - production   → Atlas $vectorSearch pipeline
+Single entry-point for vector search.  Auto-switches based on VECTOR_SEARCH_BACKEND:
+  - local  → Python cosine similarity (MongoDB Community, no $vectorSearch)
+  - atlas  → Atlas $vectorSearch pipeline (Local Atlas or Atlas Cloud)
 
 Rule from ARCHITECTURE.md:
   Always call vector_search() — never write raw MongoDB queries for embeddings.
-  Zero code changes needed when migrating to Atlas; only .env changes.
+  Zero code changes needed when migrating between local and Atlas; only .env changes.
+
+Environment Variables:
+  VECTOR_SEARCH_BACKEND=local|atlas (default: local)
+  MONGODB_URI=connection string
 """
 import os
 
@@ -41,7 +45,8 @@ def vector_search(
     Returns:
         List of chunk dicts, sorted by "score" descending.
     """
-    if os.getenv("ENVIRONMENT") == "production":
+    backend = os.getenv("VECTOR_SEARCH_BACKEND", "local").lower()
+    if backend == "atlas":
         return _atlas_search(collection, query_vector, top_k, filter_query)
     return _local_search(collection, query_vector, top_k, filter_query)
 

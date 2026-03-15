@@ -1,4 +1,14 @@
+.DS_Store
 .env 
 __pycache__/ 
 *.pyc 
 .pytest_cache/ 
+
+# Google Cloud credentials - never commit these!
+creds/*.json
+creds/*.key
+*.json.key
+
+# Outputs
+outputs/
+*.log

@@ -124,6 +124,54 @@ def chunk_text_page(
     return chunks
 
 
+def _create_table_chunk(
+    doc_id: str,
+    page_number: int,
+    table_content: str,
+    table_index: int,
+    original_format: str,
+    extra_provenance: dict | None = None,
+) -> ChunkRecord | None:
+    """
+    Create a table chunk and upload content to GCS as .txt file.
+    
+    GCS path: {doc_id}/page_{page_number}/{chunk_id}.txt
+    """
+    if not table_content.strip():
+        return None
+    
+    gcs_bucket = os.getenv("GCS_BUCKET", "rag-fl-documents")
+    chunk_id = str(uuid.uuid4())
+    gcs_path = f"{doc_id}/page_{page_number}/{chunk_id}.txt"
+    
+    # Upload table content to GCS
+    gcs_image_path = None
+    try:
+        upload_bytes(table_content.encode("utf-8"), gcs_path, content_type="text/plain")
+        gcs_image_path = f"gs://{gcs_bucket}/{gcs_path}"
+    except Exception as e:
+        logger.warning(f"Failed to upload table to GCS: {e}")
+    
+    format_provenance = {"original_format": original_format, "table_index": table_index}
+    if extra_provenance:
+        format_provenance.update(extra_provenance)
+    
+    return ChunkRecord(
+        chunk_id=chunk_id,
+        doc_id=doc_id,
+        page_number=page_number,
+        section_title="",
+        chunk_index=table_index,
+        format_provenance=format_provenance,
+        chunk_type="table",
+        chunk_text=table_content,
+        gcs_image_path=gcs_image_path,
+        embedding=None,
+        embedding_model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
+        embedding_task_type="RETRIEVAL_DOCUMENT",
+    )
+
+
 def chunk_table_page(
     plumber_pages,
     page_number: int,
@@ -137,22 +185,11 @@ def chunk_table_page(
         tables = pl_page.extract_tables()
         for t_idx, table in enumerate(tables or []):
             md = _table_to_markdown(table)
-            if not md.strip():
-                continue
-            chunks.append(ChunkRecord(
-                chunk_id=str(uuid.uuid4()),
-                doc_id=doc_id,
-                page_number=page_number,
-                section_title="",
-                chunk_index=t_idx,
-                format_provenance={"original_format": original_format, "table_index": t_idx},
-                chunk_type="table",
-                chunk_text=md,
-                gcs_image_path=None,
-                embedding=None,
-                embedding_model=os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001"),
-                embedding_task_type="RETRIEVAL_DOCUMENT",
-            ))
+            chunk = _create_table_chunk(
+                doc_id, page_number, md, t_idx, original_format
+            )
+            if chunk:
+                chunks.append(chunk)
     except Exception as e:
         logger.warning(f"Table extraction failed page {page_number}: {e}")
     return chunks
@@ -180,22 +217,11 @@ def chunk_specific_table(
         if not data:
             return []
         md = _table_to_markdown(data)
-        if not md.strip():
-            return []
-        return [ChunkRecord(
-            chunk_id=str(uuid.uuid4()),
-            doc_id=doc_id,
-            page_number=page_number,
-            section_title="",
-            chunk_index=chunk_index_start,
-            format_provenance={"original_format": original_format, "table_index": table_index},
-            chunk_type="table",
-            chunk_text=md,
-            gcs_image_path=None,
-            embedding=None,
-            embedding_model="models/gemini-embedding-001",
-            embedding_task_type="RETRIEVAL_DOCUMENT",
-        )]
+        chunk = _create_table_chunk(
+            doc_id, page_number, md, chunk_index_start, original_format,
+            extra_provenance={"table_index": table_index}
+        )
+        return [chunk] if chunk else []
     except Exception as e:
         logger.warning(f"chunk_specific_table failed page {page_number} table {table_index}: {e}")
         return []
@@ -221,24 +247,12 @@ def chunk_whitespace_table(
     if "(cid:" in md:
         logger.debug(f"Page {page_number}: whitespace table rejected — CID artifacts in content")
         return []
-    return [ChunkRecord(
-        chunk_id=str(uuid.uuid4()),
-        doc_id=doc_id,
-        page_number=page_number,
-        section_title="",
-        chunk_index=chunk_index_start,
-        format_provenance={
-            "original_format": original_format,
-            "table_index": table_index,
-            "whitespace_table": True,
-        },
-        chunk_type="table",
-        chunk_text=md,
-        gcs_image_path=None,
-        embedding=None,
-        embedding_model="models/gemini-embedding-001",
-        embedding_task_type="RETRIEVAL_DOCUMENT",
-    )]
+    
+    chunk = _create_table_chunk(
+        doc_id, page_number, md, chunk_index_start, original_format,
+        extra_provenance={"table_index": table_index, "whitespace_table": True}
+    )
+    return [chunk] if chunk else []
 
 
 def chunk_excel_sheet(
@@ -249,11 +263,24 @@ def chunk_excel_sheet(
     row_start: int,
     row_end: int,
 ) -> Optional[ChunkRecord]:
-    """One Excel sheet → one table chunk."""
+    """One Excel sheet → one table chunk. Uploads content to GCS as .txt."""
     if not markdown.strip():
         return None
+    
+    gcs_bucket = os.getenv("GCS_BUCKET", "rag-fl-documents")
+    chunk_id = str(uuid.uuid4())
+    gcs_path = f"{doc_id}/page_{page_number}/{chunk_id}.txt"
+    
+    # Upload Excel content to GCS
+    gcs_image_path = None
+    try:
+        upload_bytes(markdown.encode("utf-8"), gcs_path, content_type="text/plain")
+        gcs_image_path = f"gs://{gcs_bucket}/{gcs_path}"
+    except Exception as e:
+        logger.warning(f"Failed to upload Excel sheet to GCS: {e}")
+    
     return ChunkRecord(
-        chunk_id=str(uuid.uuid4()),
+        chunk_id=chunk_id,
         doc_id=doc_id,
         page_number=page_number,
         section_title=sheet_name,
@@ -266,7 +293,7 @@ def chunk_excel_sheet(
         },
         chunk_type="table",
         chunk_text=markdown,
-        gcs_image_path=None,
+        gcs_image_path=gcs_image_path,
         embedding=None,
         embedding_model="models/gemini-embedding-001",
         embedding_task_type="RETRIEVAL_DOCUMENT",
@@ -274,9 +301,21 @@ def chunk_excel_sheet(
 
 
 def chunk_yaml_content(doc_id: str, yaml_text: str) -> ChunkRecord:
-    """YAML file → one structured_text chunk."""
+    """YAML file → one structured_text chunk. Uploads content to GCS as .txt."""
+    gcs_bucket = os.getenv("GCS_BUCKET", "rag-fl-documents")
+    chunk_id = str(uuid.uuid4())
+    gcs_path = f"{doc_id}/page_1/{chunk_id}.txt"
+    
+    # Upload YAML content to GCS
+    gcs_image_path = None
+    try:
+        upload_bytes(yaml_text.encode("utf-8"), gcs_path, content_type="text/plain")
+        gcs_image_path = f"gs://{gcs_bucket}/{gcs_path}"
+    except Exception as e:
+        logger.warning(f"Failed to upload YAML to GCS: {e}")
+    
     return ChunkRecord(
-        chunk_id=str(uuid.uuid4()),
+        chunk_id=chunk_id,
         doc_id=doc_id,
         page_number=1,
         section_title="",
@@ -284,7 +323,7 @@ def chunk_yaml_content(doc_id: str, yaml_text: str) -> ChunkRecord:
         format_provenance={"original_format": "yaml", "key_path": "root"},
         chunk_type="text",
         chunk_text=yaml_text,
-        gcs_image_path=None,
+        gcs_image_path=gcs_image_path,
         embedding=None,
         embedding_model="models/gemini-embedding-001",
         embedding_task_type="RETRIEVAL_DOCUMENT",
@@ -302,6 +341,8 @@ def render_and_upload_multimodal(
     Render page to PNG at 2x zoom, save locally, upload to GCS.
     Returns (ChunkRecord with empty chunk_text, png_bytes).
     chunk_text must be filled by vision.py before embedding.
+    
+    GCS path: {doc_id}/page_{page_number}/{chunk_id}
     """
     output_dir = os.getenv("OUTPUT_DIR", "/output")
     gcs_bucket = os.getenv("GCS_BUCKET", "rag-fl-documents")
@@ -312,7 +353,9 @@ def render_and_upload_multimodal(
         logger.error(f"PNG render failed page {page_number}: {e}")
         return None, None
 
-    gcs_path = f"{doc_id}.{page_number}"
+    # Generate chunk_id first to use in GCS path
+    chunk_id = str(uuid.uuid4())
+    gcs_path = f"{doc_id}/page_{page_number}/{chunk_id}"
     gcs_image_path = None
     try:
         upload_bytes(png_bytes, gcs_path, content_type="image/png")
@@ -321,7 +364,7 @@ def render_and_upload_multimodal(
         logger.error(f"GCS upload failed page {page_number}: {e}")
 
     chunk = ChunkRecord(
-        chunk_id=str(uuid.uuid4()),
+        chunk_id=chunk_id,
         doc_id=doc_id,
         page_number=page_number,
         section_title="",
@@ -348,7 +391,7 @@ def chunk_full_page_image(
     Render the entire page at 2x zoom and upload to GCS as a full-page image.
     Used for full_page_image pages (mixed content: table + visual, multi-visual, etc.)
 
-    GCS key: {doc_id}.{page_number}.fullpage
+    GCS path: {doc_id}/page_{page_number}/{chunk_id}
     Returns (ChunkRecord with empty chunk_text, png_bytes).
     chunk_text must be filled by vision.describe_full_page() in pipeline.py.
     """
@@ -371,7 +414,9 @@ def chunk_full_page_image(
         logger.error(f"Full-page render failed page {page_number}: {e}")
         return None, None
 
-    gcs_key = f"{doc_id}.{page_number}"
+    # Generate chunk_id first to use in GCS path
+    chunk_id = str(uuid.uuid4())
+    gcs_key = f"{doc_id}/page_{page_number}/{chunk_id}"
     gcs_image_path = None
     try:
         upload_bytes(png_bytes, gcs_key, content_type="image/png")
@@ -380,7 +425,7 @@ def chunk_full_page_image(
         logger.error(f"GCS upload failed for full-page image page {page_number}: {e}")
 
     chunk = ChunkRecord(
-        chunk_id=str(uuid.uuid4()),
+        chunk_id=chunk_id,
         doc_id=doc_id,
         page_number=page_number,
         section_title="",
@@ -407,8 +452,8 @@ def render_and_upload_visual_region(
 ) -> tuple[Optional[ChunkRecord], Optional[bytes]]:
     """
     Render a clipped bounding-box region of a PDF page to PNG and upload to GCS.
-    visual_index=0 → gcs_key = {doc_id}.{page_number}  (backward compat with /image endpoint)
-    visual_index>0 → gcs_key = {doc_id}.{page_number}.v{visual_index}
+    
+    GCS path: {doc_id}/page_{page_number}/{chunk_id}
     Returns (ChunkRecord with empty chunk_text, png_bytes). chunk_text filled by vision.py.
     """
     output_dir = os.getenv("OUTPUT_DIR", "/output")
@@ -422,7 +467,7 @@ def render_and_upload_visual_region(
 
         flat_dir = Path(output_dir) / "flat-images"
         flat_dir.mkdir(parents=True, exist_ok=True)
-        suffix = "" if visual_index == 0 else f".v{visual_index}"
+        suffix = f"_v{visual_index}" if visual_index > 0 else ""
         out_path = flat_dir / f"{doc_id}_page_{page_number}{suffix}.png"
         pix.save(str(out_path))
 
@@ -451,11 +496,9 @@ def render_and_upload_visual_region(
         logger.error(f"Visual region render failed page {page_number} visual {visual_index}: {e}")
         return None, None
 
-    gcs_key = (
-        f"{doc_id}.{page_number}"
-        if visual_index == 0
-        else f"{doc_id}.{page_number}.v{visual_index}"
-    )
+    # Generate chunk_id first to use in GCS path
+    chunk_id = str(uuid.uuid4())
+    gcs_key = f"{doc_id}/page_{page_number}/{chunk_id}"
     gcs_image_path = None
     try:
         upload_bytes(png_bytes, gcs_key, content_type="image/png")
@@ -464,7 +507,7 @@ def render_and_upload_visual_region(
         logger.error(f"GCS upload failed page {page_number} visual {visual_index}: {e}")
 
     chunk = ChunkRecord(
-        chunk_id=str(uuid.uuid4()),
+        chunk_id=chunk_id,
         doc_id=doc_id,
         page_number=page_number,
         section_title="",
@@ -486,9 +529,12 @@ def render_and_upload_image_file(
     original_format: str,
     original_filename: str,
 ) -> tuple[Optional[ChunkRecord], bytes]:
-    """For standalone JPEG/PNG files. Upload to GCS, return chunk with empty chunk_text."""
+    """
+    For standalone JPEG/PNG files. Upload to GCS, return chunk with empty chunk_text.
+    
+    GCS path: {doc_id}/page_1/{chunk_id}
+    """
     gcs_bucket = os.getenv("GCS_BUCKET", "rag-fl-documents")
-    gcs_path = f"{doc_id}.1"
     content_type = {
         "jpeg": "image/jpeg", "jpg": "image/jpeg",
         "png": "image/png",
@@ -498,6 +544,10 @@ def render_and_upload_image_file(
         "webp": "image/webp",
     }.get(original_format, "image/jpeg")
 
+    # Generate chunk_id first to use in GCS path
+    chunk_id = str(uuid.uuid4())
+    gcs_path = f"{doc_id}/page_1/{chunk_id}"
+
     gcs_image_path = None
     try:
         upload_bytes(image_bytes, gcs_path, content_type=content_type)
@@ -506,7 +556,7 @@ def render_and_upload_image_file(
         logger.error(f"GCS upload failed for image {original_filename}: {e}")
 
     chunk = ChunkRecord(
-        chunk_id=str(uuid.uuid4()),
+        chunk_id=chunk_id,
         doc_id=doc_id,
         page_number=1,
         section_title="",
@@ -575,7 +625,35 @@ def _table_to_markdown(table: list) -> str:
     return "\n".join(rows)
 
 
+def _upload_text_to_gcs(
+    content: str,
+    doc_id: str,
+    page_number: int,
+    chunk_idx: int,
+    content_type: str = "text"
+) -> str | None:
+    """
+    Upload text content to GCS as .txt file.
+    Returns the gs:// URI or None if upload fails.
+    
+    GCS path: {doc_id}/page_{page_number}/{chunk_id}.txt
+    """
+    gcs_bucket = os.getenv("GCS_BUCKET", "rag-fl-documents")
+    chunk_id = str(uuid.uuid4())
+    gcs_path = f"{doc_id}/page_{page_number}/{chunk_id}.txt"
+    
+    try:
+        upload_bytes(content.encode("utf-8"), gcs_path, content_type="text/plain")
+        return f"gs://{gcs_bucket}/{gcs_path}"
+    except Exception as e:
+        logger.warning(f"Failed to upload text to GCS: {e}")
+        return None
+
+
 def _text_chunk(doc_id, page_number, text, original_format, section_title, chunk_idx) -> ChunkRecord:
+    # Upload text content to GCS
+    gcs_path = _upload_text_to_gcs(text, doc_id, page_number, chunk_idx, content_type="text")
+    
     return ChunkRecord(
         chunk_id=str(uuid.uuid4()),
         doc_id=doc_id,
@@ -585,7 +663,7 @@ def _text_chunk(doc_id, page_number, text, original_format, section_title, chunk
         format_provenance={"original_format": original_format},
         chunk_type="text",
         chunk_text=text,
-        gcs_image_path=None,
+        gcs_image_path=gcs_path,  # Now points to .txt file in GCS
         embedding=None,
         embedding_model="models/gemini-embedding-001",
         embedding_task_type="RETRIEVAL_DOCUMENT",
